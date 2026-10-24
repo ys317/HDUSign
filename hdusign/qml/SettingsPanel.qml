@@ -20,6 +20,18 @@ Flickable {
         Item { width: 1; height: 2 }
     }
 
+    Dialog {
+        id: deleteAccountDialog
+        property string account: ""
+        title: "删除已保存账号"
+        width: 420
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        contentItem: Label { text: "删除账号 " + deleteAccountDialog.account + " 的密码和浏览器登录状态？"; wrapMode: Text.Wrap }
+        onAccepted: appController.deleteAccount(account)
+    }
+
     Column {
         id: fields
         objectName: "settingsDocument"
@@ -37,6 +49,27 @@ Flickable {
         }
 
         Heading { text: "直播账号" }
+        Row {
+            spacing: 8
+            ComboBox {
+                id: savedAccountBox
+                objectName: "savedAccountBox"
+                width: Math.min(280, fields.width - 200)
+                model: appController.savedAccounts
+                currentIndex: -1
+                displayText: currentIndex < 0 ? "选择已保存账号" : currentText
+                enabled: accountManager !== null || !appController.state.busy
+                onActivated: appController.selectAccount(currentText)
+            }
+            UiButton { text: "新账号"; outline: true; enabled: accountManager !== null || !appController.state.busy; onClicked: { savedAccountBox.currentIndex = -1; appController.selectAccount("") } }
+            UiButton {
+                text: "删除账号"; outline: true
+                enabled: !appController.state.busy && savedAccountBox.currentIndex >= 0
+                onClicked: { deleteAccountDialog.account = savedAccountBox.currentText; deleteAccountDialog.open() }
+            }
+        }
+        UiText { width: parent.width; text: "选中账号后可修改学号或密码，登录成功后保存。修改学号会另存为新账号。"; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap }
+        Toggle { caption: "记住此账号"; description: "登录成功后加密保存，下次自动填入。关闭时本次登录不更新已保存账号。"; fieldKey: "remember"; enabled: !appController.state.busy }
         Field { viewport: panel; caption: "学号 / 账号"; fieldKey: "username"; enabled: !appController.state.busy }
         Field { viewport: panel; caption: "密码"; fieldKey: "password"; secret: true; enabled: !appController.state.busy }
         Row {
@@ -49,20 +82,6 @@ Flickable {
         Toggle { caption: "后台直播音频"; description: "选择课程后直接接收直播声音，关闭时使用电脑声音。"; fieldKey: "live" }
         Field { viewport: panel; caption: "课程网址（选填）"; fieldKey: "url"; hint: "选课后自动填写，也可粘贴课程链接。" }
         UiButton { text: "打开课程页面 ↗"; outline: true; onClicked: appController.openCourse() }
-
-        Heading { text: "签到辅助" }
-        Toggle { caption: "自动签到"; description: "确认签到码后自动在签到页面提交。"; fieldKey: "autoSign" }
-        Row {
-            width: parent.width; spacing: 12
-            Field { width: (parent.width - 12) / 2; viewport: panel; caption: "纬度"; fieldKey: "latitude" }
-            Field { width: (parent.width - 12) / 2; viewport: panel; caption: "经度"; fieldKey: "longitude" }
-        }
-        UiText { width: parent.width; text: appController.state.locationHint; wrapMode: Text.Wrap; color: Theme.muted; font.pixelSize: 13 }
-        Row {
-            spacing: 8
-            UiButton { text: "获取当前位置"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("locate") }
-            UiButton { text: "重新登录签到"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("signin") }
-        }
 
         Heading { text: "识别与通知" }
         Toggle { caption: "语义辅助识别"; description: "使用本地语义模型辅助判断签到提示。"; fieldKey: "semantic" }
@@ -82,8 +101,47 @@ Flickable {
                 }
             }
         }
-        Field { viewport: panel; caption: "企业微信 Webhook"; fieldKey: "webhook"; secret: true }
-        UiButton { text: "测试推送"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("webhook") }
+        Heading { text: "诊断与日志" }
+        Toggle {
+            objectName: "diagnosticToggle"
+            caption: "启用启动音频诊断"; fieldKey: "diagnostic"
+            description: "保存开课前 2 分钟至开课后 1 分钟的音频；中途启动保存起始 3 分钟。下次监听生效。"
+            enabled: !appController.state.busy
+        }
+        UiText {
+            width: parent.width; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap
+            text: "完整监听日志按账号始终保存。诊断开启时，另存音量、识别耗时、实时草稿和最多约 3 分钟 WAV 音频；低音量不等于没有人声。"
+        }
+        UiButton { objectName: "openLogsButton"; text: "打开本账号日志目录"; outline: true; onClicked: appController.openLogs() }
+
+        Heading { text: "微信机器人" }
+        Column {
+            visible: accountManager !== null
+            width: parent.width; spacing: 8
+            UiText { text: "新增预约默认使用的机器人"; color: Theme.muted; font.pixelSize: 13 }
+            Row {
+                spacing: 8
+                ComboBox {
+                    id: webhookBox
+                    objectName: "webhookBox"
+                    width: Math.min(380, fields.width - 160)
+                    model: accountManager ? accountManager.webhookChoices : []
+                    textRole: "name"
+                    currentIndex: accountManager ? Math.max(0, model.findIndex(item => item.identity === accountManager.webhookBinding)) : -1
+                    enabled: !appController.state.busy
+                    onActivated: accountManager.assignWebhook(model[currentIndex].identity)
+                }
+                UiButton {
+                    text: "设为共用默认"; outline: true
+                    enabled: !appController.state.busy && webhookBox.currentIndex > 0
+                    onClicked: accountManager.setDefaultWebhook(webhookBox.model[webhookBox.currentIndex].identity)
+                }
+            }
+            UiText { width: parent.width; text: "每门预约独立绑定机器人；更改此处不影响已有预约。机器人被预约或监听占用时，需要另选空闲机器人。新名称或链接测试成功才保存。"; wrapMode: Text.Wrap; color: Theme.muted; font.pixelSize: 12 }
+            Field { viewport: panel; caption: "机器人名称"; fieldKey: "webhookName"; enabled: !appController.state.busy }
+        }
+        Field { viewport: panel; caption: "企业微信 Webhook"; fieldKey: "webhook"; secret: true; enabled: !appController.state.busy }
+        UiButton { objectName: "testWebhookButton"; text: accountManager ? "测试推送并保存机器人" : "测试推送"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("webhook") }
         Item { width: 1; height: 12 }
         UiText { text: appController.state.version; color: Theme.subtle; font.pixelSize: 11 }
     }

@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 import requests
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from hdusign.runtime import application_root, configure_browser_runtime
+from hdusign.runtime import data_root as application_root, configure_browser_runtime
 
 
 _SITE_HOSTS = frozenset(("course.hdu.edu.cn",
@@ -48,6 +48,10 @@ class LiveEnded(LiveError):
     """The requested live class has ended; do not retry or select another one."""
 
 
+class LiveNotStarted(LiveError):
+    """A scheduled stream may be retried within its bounded startup window."""
+
+
 class LiveLoginRequired(LiveError):
     """The user needs to complete the separate live-platform login."""
 
@@ -72,6 +76,22 @@ class LiveCourse:
     section: str = ""
     tecl_id: str = ""
     origin: str = "https://course.hdu.edu.cn"
+    subject_id: str = ""
+    room_id: str = ""
+    term_id: str = ""
+    number: int = 0
+    lesson_ids: tuple[str, ...] = ()
+    lesson_starts: tuple[float, ...] = ()
+    lesson_ends: tuple[float, ...] = ()
+
+    def __post_init__(self):
+        # YAML/JSON restore arrays as lists. Keep scheduled and fresh courses
+        # identical and immutable when passed between GUI and worker threads.
+        for name in ("lesson_ids", "lesson_starts", "lesson_ends"):
+            value = getattr(self, name)
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("连堂课资料无效，请重新刷新课程。")
+            object.__setattr__(self, name, tuple(value))
 
 
 def _plain(value: object) -> bool:
@@ -325,17 +345,32 @@ def _normalise_course(record: object, origin: str) -> LiveCourse | None:
         raw = str(number).strip()
         if re.fullmatch(r"[0-9]{1,3}(?:\.0+)?", raw) and int(float(raw)) > 0:
             section = f"第{int(float(raw))}节"
+    def identifier(key):
+        value = record.get(key)
+        return str(int(value)) if (not isinstance(value, bool)
+                                   and re.fullmatch(r"[0-9]{1,20}", str(value or ""))
+                                   and int(value) > 0) else ""
     return LiveCourse(str(int(course_id)), title, start, end, _teacher(record),
-                      _text(record.get("clroName")), section, tecl_id, origin)
+                      _text(record.get("clroName")), section, tecl_id, origin,
+                      subject_id=identifier("subjId"), room_id=identifier("clroId"),
+                      term_id=identifier("acteId"),
+                      number=int(float(raw)) if section else 0)
 
 
-def _course_list_page(session, origin: str, page: int, live_day: int = 0) -> dict:
+def _course_list_page(session, origin: str, page: int, live_day: int = 0,
+                      *, timetable=None) -> dict:
+    params = {"page.pageIndex": page, "page.pageSize": 1000,
+              "page.orders[0].asc": "true", "page.orders[0].field": "courBeginTime"}
+    endpoint = "/v1/vod_live/t-1"
+    if timetable is None:
+        params["liveDay"] = live_day
+    else:
+        term, first, last = timetable
+        endpoint = "/v1/myself/curriculum"
+        params.update(acteId=term, courBeginTime=first, courEndTime=last)
     try:
         response = session.get(
-            origin + _API + "/v1/vod_live/t-1",
-            params={"page.pageIndex": page, "page.pageSize": 1000,
-                    "page.orders[0].asc": "true",
-                    "page.orders[0].field": "courBeginTime", "liveDay": live_day},
+            origin + _API + endpoint, params=params,
             timeout=(10, 15), allow_redirects=False)
     except requests.exceptions.SSLError:
         raise LiveError("课堂直播平台的安全连接验证失败，请检查系统时间或联系平台。") from None
@@ -361,42 +396,93 @@ def _now() -> float:
     return time.time()
 
 
+def _read_course_pages(session, origin, stop, timetable=None):
+    unique = {}
+    received = 0
+    previous_ids = None
+    for page in range(1, 21):
+        if stop is not None and stop.is_set():
+            raise LiveError("读取直播课程已取消。")
+        data = (_course_list_page(session, origin, page) if timetable is None else
+                _course_list_page(session, origin, page, timetable=timetable))
+        if stop is not None and stop.is_set():
+            raise LiveError("读取直播课程已取消。")
+        records = data["records"]
+        received += len(records)
+        courses = [course for course in (_normalise_course(record, origin) for record in records)
+                   if course is not None]
+        if timetable is not None and len(courses) != len(records):
+            raise LiveError("完整课表含无效节次，暂不能识别连堂课。")
+        ids = tuple(course.course_id for course in courses)
+        if records and ids == previous_ids:
+            raise LiveError("直播课程分页未更新，请稍后刷新。")
+        previous_ids = ids
+        unique.update((course.course_id, course) for course in courses)
+        # HDU's real pagination uses rowCount; retain total for older responses.
+        total = data.get("total", data.get("rowCount"))
+        if (not records or (type(total) is int and 0 <= total <= received)
+                or (type(total) is not int and len(records) < 1000)):
+            break
+    else:
+        raise LiveError("直播课程过多，暂时无法完整读取，请稍后刷新或手动填写网址。")
+    return unique
+
+
 def list_live_courses(config: dict | None = None, *, stop=None) -> list[LiveCourse]:
-    """Return the current account's live lessons without opening a playback page."""
+    """Read live entries and optionally recover all cells from the own timetable."""
     origin = _list_origin(config)
     session, cookies = _authenticated_session(origin, config)
     requested_at = _now()
     try:
-        unique = {}
-        received = 0
-        previous_ids = None
-        for page in range(1, 21):
-            if stop is not None and stop.is_set():
-                raise LiveError("读取直播课程已取消。")
-            data = _course_list_page(session, origin, page)
-            if stop is not None and stop.is_set():
-                raise LiveError("读取直播课程已取消。")
-            records = data["records"]
-            received += len(records)
-            courses = [course for course in (_normalise_course(record, origin) for record in records)
-                       if course is not None]
-            ids = tuple(course.course_id for course in courses)
-            if records and ids == previous_ids:
-                raise LiveError("直播课程分页未更新，请稍后刷新。")
-            previous_ids = ids
-            unique.update((course.course_id, course) for course in courses)
-            total = data.get("total")
-            if (not records or (type(total) is int and 0 <= total <= received)
-                    or (type(total) is not int and len(records) < 1000)):
-                break
-        else:
-            raise LiveError("直播课程过多，暂时无法完整读取，请稍后刷新或手动填写网址。")
+        unique = _read_course_pages(session, origin, stop)
 
         current = dt.datetime.fromtimestamp(requested_at, _BEIJING).date()
         visible_dates = {current, current + dt.timedelta(days=1)}
+        continuous = bool(((config or {}).get("live_audio") or {}).get("continuous", False))
+        grouping_available = not continuous
+        if continuous:
+            terms = sorted({c.term_id for c in unique.values() if c.term_id})
+            try:
+                if not terms or len(terms) > 3:
+                    raise LiveError("直播列表缺少完整学期信息。")
+                timetable_courses = {}
+                first, last = f"{current} 00:00:00", f"{current + dt.timedelta(days=1)} 23:59:59"
+                for term in terms:
+                    timetable_courses.update(_read_course_pages(session, origin, stop, (term, first, last)))
+                # Restrict to teaching classes already visible to this account
+                # in the live list, including their earlier timetable cells.
+                keys = {(c.tecl_id, c.subject_id, c.term_id) for c in unique.values()}
+                timetable_courses = {cid: c for cid, c in timetable_courses.items()
+                                     if (c.tecl_id, c.subject_id, c.term_id) in keys}
+                for cid, course in timetable_courses.items():
+                    previous = unique.get(cid)
+                    if previous is not None and (previous.tecl_id, previous.start, previous.end,
+                                                 previous.subject_id, previous.room_id, previous.term_id) != (
+                            course.tecl_id, course.start, course.end,
+                            course.subject_id, course.room_id, course.term_id):
+                        raise LiveError("直播列表与课表资料不一致。")
+                # A live entry absent from the complete timetable cannot be
+                # assumed to be the first cell of a complete class.
+                verified = {cid: c for cid, c in timetable_courses.items()}
+                missing = [c for cid, c in unique.items() if cid not in verified]
+                unique = verified
+                grouping_available = True
+            except LiveLoginRequired:
+                raise
+            except LiveError as exc:
+                if stop is not None and stop.is_set():
+                    raise
+                print(f"[!] 完整课表读取失败，当前只提供单节监控：{exc}")
+                missing = []
+        else:
+            missing = []
         courses = [course for course in unique.values()
                    if dt.datetime.fromtimestamp(course.start, _BEIJING).date() in visible_dates]
-        return sorted(courses, key=lambda course: (course.start, course.end, course.course_id))
+        from hdusign.lessons import group_lessons
+        result = group_lessons(courses) if grouping_available else courses
+        result.extend(c for c in missing
+                      if dt.datetime.fromtimestamp(c.start, _BEIJING).date() in visible_dates)
+        return sorted(result, key=lambda c: (c.start, c.end, c.course_id))
     finally:
         session.headers.pop("jwt-token", None)
         session.cookies.clear()
@@ -413,6 +499,14 @@ class LiveClient:
         self.origin, self.course_id = parse_live_page(page_url)
         self._session, self._cookies = _authenticated_session(self.origin, config)
         self._closed = False
+        self.lesson_end = None
+
+    def select_lesson(self, course_id: str, end: float) -> None:
+        """Set a verified timetable block; the first stream covers two lessons."""
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", course_id) or not math.isfinite(end):
+            raise LiveError("连堂课资料无效，请重新选择课程。")
+        self.course_id = course_id
+        self.lesson_end = end
 
     def __enter__(self):
         return self
@@ -461,7 +555,7 @@ class LiveClient:
         # The platform uses business status 501 for "live has not started";
         # it is not the same condition as an HTTP 501 server failure.
         if _status(payload.get("status"), 501):
-            raise LiveError("这节直播尚未开始，请开播后再试。")
+            raise LiveNotStarted("这节直播尚未开始，请开播后再试。")
         if _transient_status(payload.get("status")) or _transient_status(payload.get("code")):
             raise LiveTransientError("课堂直播平台暂时无法提供音频，请稍后重试。")
         if (not _status(payload.get("status"), 200) or payload.get("ok") is False
@@ -479,8 +573,11 @@ class LiveClient:
                 or (start is not None and end is not None and end <= start)):
             raise LiveError("无法确认当前直播时段，请在网页确认这节课正在直播。")
         if start is not None and now < start:
-            raise LiveError("这节直播尚未开始，请开播后再试。")
-        if end is not None and now >= end:
+            raise LiveNotStarted("这节直播尚未开始，请开播后再试。")
+        # Only an explicitly verified two/three-lesson plan can extend the
+        # first cell's window. Authentication/permission/format checks remain.
+        effective_end = self.lesson_end if self.lesson_end is not None else end
+        if effective_end is not None and now >= effective_end:
             raise LiveEnded("这节直播已经结束，请使用当前正在上课的直播链接。")
         views = info.get("courseDeviceViewDtoList")
         if not isinstance(views, list):
@@ -514,32 +611,63 @@ class LiveClient:
 
 
 _PROBE_LOGIN_JS = """
-async ({origin, apiPath}) => {
+({origin}) => {
     if (location.origin !== origin) return {ok: false};
-    const keys = Object.keys(sessionStorage).filter(k => k.endsWith("_STORAGE_KEY_JWT_TOKEN"));
-    const jwt = keys.length === 1 ? sessionStorage.getItem(keys[0]) || "" : "";
-    const headers = {"Accept": "application/json"};
-    if (jwt) headers["jwt-token"] = jwt;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
+    if (/^#\\/?login(?:[/?]|$)/i.test(location.hash)) return {ok: false};
     try {
-        const response = await fetch(apiPath, {
-            method: "GET", credentials: "include", redirect: "error",
-            headers, signal: controller.signal
-        });
-        if (response.status !== 200) return {ok: false};
-        const body = await response.json();
-        return {ok: !!body && body.ok === true && body.status === 200 &&
-                    !!body.data && body.data.id !== undefined &&
-                    body.data.id !== null && String(body.data.id).trim() !== "",
-                jwt_token: jwt};
+        const keys = Object.keys(sessionStorage).filter(k => k.endsWith("_STORAGE_KEY_JWT_TOKEN"));
+        const jwt = keys.length === 1 ? sessionStorage.getItem(keys[0]) || "" : "";
+        return {ok: !!jwt, jwt_token: jwt};
     } catch (_) {
         return {ok: false};
-    } finally {
-        clearTimeout(timer);
     }
 }
 """
+
+
+def _login_candidate(page, origin):
+    """Read browser storage only; never run authenticated fetch in a page."""
+    current = _url(page.url)
+    if (current is None or current.scheme != "https" or current.port not in (None, 443)
+            or "https://" + current.hostname != origin
+            or re.match(r"^/?login(?:[/?]|$)", current.fragment, re.I)):
+        return ""
+    result = page.evaluate(_PROBE_LOGIN_JS, {"origin": origin})
+    jwt = result.get("jwt_token", "") if isinstance(result, dict) and result.get("ok") is True else ""
+    return jwt if _plain(jwt) and jwt.isascii() else ""
+
+
+def _verify_browser_login(context, origin, jwt):
+    """APIRequestContext handles a 401 without Chromium's Basic Auth dialog."""
+    response = None
+    try:
+        response = context.request.get(
+            origin + _API + "/v1/currentuser", headers={"Accept": "application/json", "jwt-token": jwt},
+            timeout=4000, max_redirects=0, fail_on_status_code=False)
+        if response.status in (401, 403):
+            return {"ok": False, "rejected": True}
+        if response.status != 200:
+            return {"ok": False}
+        body = response.json()
+        if not isinstance(body, dict):
+            return {"ok": False}
+        if _status(body.get("status"), 401) or _status(body.get("code"), 401):
+            return {"ok": False, "rejected": True}
+        data = body.get("data")
+        if (body.get("ok") is not True or not _status(body.get("status"), 200)
+                or not isinstance(data, dict) or data.get("id") is None or not str(data["id"]).strip()):
+            return {"ok": False}
+        return {"ok": True,
+                "display_name": data["userName"].strip() if isinstance(data.get("userName"), str) else "",
+                "user_code": str(data.get("userCode") or "").strip()}
+    except (PlaywrightError, ValueError):
+        return {"ok": False}
+    finally:
+        if response is not None:
+            try:
+                response.dispose()
+            except PlaywrightError:
+                pass
 
 
 def _block_viewing_writes(route) -> None:
@@ -566,7 +694,8 @@ def _saved_manual_login(origin: str) -> bool:
 
 
 def _save_session(origin: str, cookies: list[dict], jwt: str,
-                  *, login_mode: str | None = None, username: str | None = None) -> None:
+                  *, login_mode: str | None = None, username: str | None = None,
+                  display_name: str = "", user_code: str = "") -> None:
     root = application_root()
     temporary = None
     failed = False
@@ -580,6 +709,10 @@ def _save_session(origin: str, cookies: list[dict], jwt: str,
                 saved["login_mode"] = "manual"
             if username is not None:
                 saved["username"] = username
+            if isinstance(display_name, str) and display_name.strip():
+                saved["display_name"] = display_name.strip()[:100]
+            if isinstance(user_code, str) and user_code.strip():
+                saved["user_code"] = user_code.strip()[:100]
             json.dump(saved, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
@@ -594,6 +727,49 @@ def _save_session(origin: str, cookies: list[dict], jwt: str,
                 failed = True
     if failed:
         raise LiveError("无法保存直播登录资料，请检查程序目录的写入权限。")
+
+
+def notification_name(config: dict) -> str:
+    """Read the authenticated account's official name, never infer from a title."""
+    context = config.get("notification_context") or {}
+    if not isinstance(context, dict):
+        return ""
+    expected = str(context.get("username") or "").strip()
+    try:
+        origin = parse_live_origin(str(config.get("live_url") or "https://course.hdu.edu.cn/"))
+        saved = json.loads((application_root() / "live_session.json").read_text("utf-8-sig"))
+        if not isinstance(saved, dict) or saved.get("origin") != origin:
+            return ""
+        if expected and saved.get("username", saved.get("user_code")) != expected:
+            return ""
+        if (isinstance(saved.get("display_name"), str) and saved.get("user_code")
+                and (not expected or saved["user_code"] == expected)):
+            return saved["display_name"].strip()[:100]
+        # Older sessions have no profile name. Resolve it once using the same
+        # authenticated read-only endpoint, without making the user log in again.
+        session, _ = _authenticated_session(origin, config)
+        try:
+            response = session.get(origin + _API + "/v1/currentuser",
+                                   timeout=(3, 4), allow_redirects=False)
+            if response.status_code != 200:
+                return ""
+            body = response.json()
+            if not isinstance(body, dict) or body.get("ok") is not True or not _status(body.get("status"), 200):
+                return ""
+            data = body.get("data")
+            if not isinstance(data, dict) or data.get("id") in (None, ""):
+                return ""
+            code = str(data.get("userCode") or "").strip()
+            name = data.get("userName")
+            if not isinstance(name, str) or not name.strip() or (expected and code != expected):
+                return ""
+            return name.strip()[:100]
+        finally:
+            session.cookies.clear()
+            session.headers.pop("jwt-token", None)
+            session.close()
+    except (OSError, ValueError, LiveError, requests.RequestException):
+        return ""
 
 
 def login_live(page_url: str, stop=None, *, switch_account: bool = False,
@@ -631,6 +807,8 @@ def login_live(page_url: str, stop=None, *, switch_account: bool = False,
                 deadline = time.monotonic() + _LOGIN_TIMEOUT_SECONDS
                 attempted = False
                 fill_attempts = 0
+                probe_token, probe_attempts, next_probe_at = "", 0, 0.0
+                rejected_tokens = set()
                 while time.monotonic() < deadline:
                     if stop is not None and stop.is_set():
                         print("直播登录已取消。")
@@ -662,23 +840,40 @@ def login_live(page_url: str, stop=None, *, switch_account: bool = False,
                           and current.hostname in _SITE_HOSTS
                           and "https://" + current.hostname == origin):
                         try:
-                            result = page.evaluate(_PROBE_LOGIN_JS, {
-                                "origin": origin, "apiPath": _API + "/v1/currentuser"})
+                            jwt = _login_candidate(page, origin)
                             if stop is not None and stop.is_set():
                                 print("直播登录已取消。")
                                 return 1
-                            if isinstance(result, dict) and result.get("ok") is True:
-                                jwt = result.get("jwt_token", "")
+                            if jwt and jwt != probe_token:
+                                probe_token, probe_attempts, next_probe_at = jwt, 0, 0.0
+                            result = {"ok": False}
+                            if (jwt and jwt not in rejected_tokens
+                                    and time.monotonic() >= next_probe_at):
+                                probe_attempts += 1
+                                next_probe_at = time.monotonic() + min(2 ** min(probe_attempts, 4), 15)
+                                result = _verify_browser_login(context, origin, jwt)
+                                if result.get("rejected"):
+                                    rejected_tokens.add(jwt)
+                                    print("[!] 当前登录凭据已失效，请在窗口中重新登录；取得新凭据后会继续验证。")
+                            if stop is not None and stop.is_set():
+                                print("直播登录已取消。")
+                                return 1
+                            if result.get("ok") is True and _login_candidate(page, origin) == jwt:
                                 cookies = _cookies_for_origin(context.cookies(
                                     [origin + "/", origin + _API + "/v1/currentuser"]), origin)
                                 if stop is not None and stop.is_set():
                                     print("直播登录已取消。")
                                     return 1
+                                if _login_candidate(page, origin) != jwt:
+                                    page.wait_for_timeout(250)
+                                    continue
                                 if _plain(jwt) and jwt.isascii() and (jwt or cookies):
                                     identity = ({"username": str(credentials.get("skl_username", "")).strip()}
                                                 if credentials is not None and not manual_login else {})
                                     _save_session(origin, cookies, jwt,
-                                                  login_mode="manual" if manual_login else None, **identity)
+                                                  login_mode="manual" if manual_login else None,
+                                                  display_name=result.get("display_name", ""),
+                                                  user_code=result.get("user_code", ""), **identity)
                                     print("直播登录已保存，可启动后台音频监控。")
                                     return 0
                         except PlaywrightError:

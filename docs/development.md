@@ -1,5 +1,7 @@
 # 开发指南
 
+> 历史适用范围：本文保留上游开发命令、构建及技术背景，其中单预约、切换账号清预约、分节尚未实现等业务描述属于旧版。修改前必须阅读[开发约定](开发约定.md)和[功能规则](功能规则.md)。本地增量构建见[连堂课文档](continuous-lessons.md#构建)，后续产物命名须遵守新约定；本文发布命令不代表用户已授权发布。
+
 Windows x64，Python 3.13。
 
 ## 本地运行
@@ -25,7 +27,7 @@ python -m hdusign test --help
 python -m hdusign code
 ```
 
-`demo` 用于检查匹配规则，`--login` 打开登录浏览器。`test` 与 `run` 使用配置中的通知和签到选项；离线调试时应关闭 `auto_sign.enabled` 并清空 Webhook。
+`demo` 用于检查匹配规则；直播登录从桌面账号入口发起。当前源码已删除自动签到及旧 `--login`、`--sign`、`--sign-worker` 入口。`test` 与 `run` 仅识别并按配置通知，离线调试时清空 Webhook 或模拟 HTTP，避免真实推送。旧 `auto_sign` 配置不再生效。
 
 ## 构建
 
@@ -51,7 +53,7 @@ python -m hdusign code
 | `tools/` | `release.py` 构建与发布；`assets.py` 资源维护；`HDUSign.spec` 打包配置 |
 | `assets/`、`docs/` | 图标、截图与文档 |
 
-应用内部由 `audio.py` 负责采集和转写，`rules.py` 负责匹配与提码，`monitor.py` 连接识别流程；`attendance.py` 管理签到任务与结果，`browser.py` 负责网页操作。`desktop_controller.py` 在线程间传递事件并维护增量数据模型，`qt_app.py` 启动 Qt Quick，`qml/` 维护主题和控件，`runtime.py` 处理源码与便携版的资源路径。
+应用内部由 `audio.py` 负责采集和转写，`rules.py` 负责匹配与提码，`monitor.py` 连接识别流程；`browser.py` 仅保留直播登录共用辅助和旧浏览器目录清理，原 `attendance.py` 已删除。`desktop_controller.py` 在线程间传递事件并维护增量数据模型，`qt_app.py` 启动 Qt Quick，`qml/` 维护主题和控件，`runtime.py` 处理源码与便携版的资源路径。
 
 `live.py` 只通过杭电已验证的直播接口读取单节 HTTP(S)-FLV 播放信息，使用独立的直播登录态；`media.py` 通过隐藏的 FFmpeg 子进程输出 16 kHz 单声道音频，不解码画面。直播输入按网络速度读取，不使用 `-re` 限速：限速不能平滑断续后的补发突发，却会在服务器时间戳跳变时一直等待到空闲超时。约 10 秒的有界队列吸收补发突发和识别器的短暂停顿，识别器通常快于实时，积压会在数秒内消化。队列仍然填满时丢弃整段积压、从当前直播声音继续，并在下一块音频前报告跳过的时长；监控层据此重置识别器与未确认的候选码，不断开连接，也不把它计入故障窗口，断点两侧的数字不会拼成签到码。断流不冲刷未完成的识别结果。媒体请求只携带取流令牌和必要的公开请求头，不转发站点 Cookie/JWT；HTTPS 验证证书，暂不接受 HLS。
 

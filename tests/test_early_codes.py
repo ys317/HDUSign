@@ -15,7 +15,6 @@ class EarlyCodeTests(unittest.TestCase):
     def setUp(self):
         self.clock = AudioClock()
         self.watcher = SignInWatcher(log_file=os.devnull, clock=self.clock, early_code=True)
-        self.watcher.on_prepare = Mock()
 
     def partial(self, text, t, revision, cue=False):
         self.clock.seconds = t
@@ -33,12 +32,11 @@ class EarlyCodeTests(unittest.TestCase):
         self.assertEqual(self.partial(text, 3, 8, True), [])
         self.assertEqual(self.partial(text, 3.25, 9, True), [("1234", text)])
 
-    def test_bare_tail_prepares_but_never_submits_even_after_long_pause(self):
+    def test_bare_tail_never_confirms_even_after_long_pause(self):
         self.assertEqual(self.partial("一八三六", 1, 1), [])
         self.assertEqual(self.partial("一八三六", 5, 8), [])
         self.assertEqual(self.partial("一八三六二", 5.5, 9), [])
         self.assertEqual(self.watcher.codes_found, [])
-        self.watcher.on_prepare.assert_called()
 
     def test_phone_decimal_and_units_cannot_be_closed_code_boundaries(self):
         for suffix in (" 2345678", ".56", "万元左右", "年以后", "号同学"):
@@ -116,15 +114,16 @@ class EarlyCodeTests(unittest.TestCase):
                 return [], ("签到码一二三四" if inner.revision == 1 else "签到码一二三四大家继续听课")
 
             def flush(inner):
-                self.assertEqual(signer.submit.call_count, 1)
+                self.assertEqual(len(watcher.codes_found), 1)
                 return ["签到码一二三四大家继续听课"]
 
-        signer, alerter = Mock(), Mock()
-        watcher = make_watcher({"code_watch": {"log_file": os.devnull}}, alerter, signer, clock=self.clock)
+        alerter = Mock()
+        watcher = make_watcher({"code_watch": {"log_file": os.devnull}}, alerter, clock=self.clock)
         with redirect_stdout(StringIO()):
             run_pipeline(self.clock.advance([np.zeros(8000)] * 2), Recognizer(),
                          [RuleMatcher(["签到"], [])], alerter, watcher, show_partial=False, clock=self.clock)
-        signer.submit.assert_called_once_with("1234")
+        self.assertEqual([code for code, _ in watcher.codes_found], ["1234"])
+        alerter.notify.assert_any_call("签到码一二三四大家继续听课", "code", "签到码: 1234")
 
     def test_empty_decoder_update_breaks_candidate_stability_in_pipeline(self):
         updates = iter(("一二三四大家", "", "一二三四大家"))

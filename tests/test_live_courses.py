@@ -163,6 +163,64 @@ class LiveCourseListTests(unittest.TestCase):
             2026, 9, 22, 8, 55, tzinfo=dt.timezone(dt.timedelta(hours=8))).timestamp()
         self.assertEqual(second.start, expected_start)
 
+    def test_real_timetable_fields_create_one_three_lesson_course(self):
+        rows = [record(123+i, subjId=67, clroId=89, acteId=9, letiNumber=3+i,
+                       courBeginTime=f"2026-09-22 {hour}", courEndTime=f"2026-09-22 {end}")
+                for i, (hour, end) in enumerate([
+                    ("10:00:00", "10:45:00"), ("10:50:00", "11:35:00"),
+                    ("11:40:00", "12:25:00")])]
+        self.response.json.return_value = payload(rows)
+        courses = self.list()
+        self.assertEqual(len(courses), 1)
+        self.assertEqual(courses[0].lesson_ids, ("123", "124", "125"))
+        self.assertEqual(courses[0].end - courses[0].start, 145 * 60)
+        self.assertEqual(courses[0].section, "第3–5节 · 3节连堂")
+
+    def test_real_row_count_pagination_does_not_lose_the_third_lesson(self):
+        pages = []
+        for i, (start, end) in enumerate([("10:00:00", "10:45:00"),
+                                         ("10:50:00", "11:35:00"),
+                                         ("11:40:00", "12:25:00")]):
+            body = payload([record(123+i, subjId=67, clroId=89, acteId=9, letiNumber=3+i,
+                                   courBeginTime=f"2026-09-22 {start}",
+                                   courEndTime=f"2026-09-22 {end}")])
+            body['data'].update(rowCount=3, pageSize=1, pageCount=3, pageIndex=i+1)
+            pages.append(body)
+        self.response.json.side_effect = pages
+        courses = self.list()
+        self.assertEqual(courses[0].lesson_ids, ('123', '124', '125'))
+        self.assertEqual(self.get.call_count, 3)
+
+    def test_complete_own_timetable_recovers_an_already_hidden_first_cell(self):
+        rows = [record(123+i, subjId=67, clroId=89, acteId=9, letiNumber=3+i,
+                       courBeginTime=f"2026-09-22 {start}", courEndTime=f"2026-09-22 {end}")
+                for i, (start, end) in enumerate([('10:00:00', '10:45:00'),
+                                                  ('10:50:00', '11:35:00'),
+                                                  ('11:40:00', '12:25:00')])]
+        self.response.json.side_effect = [payload(rows[1:]), payload(rows)]
+        courses = self.list({'live_audio': {'continuous': True}})
+        self.assertEqual(len(courses), 1)
+        self.assertEqual(courses[0].course_id, '123')
+        self.assertEqual(courses[0].lesson_ids, ('123', '124', '125'))
+        args = self.get.call_args_list[1]
+        self.assertEqual(args.args[1], ORIGIN + live._API + '/v1/myself/curriculum')
+        self.assertEqual(args.kwargs['params']['acteId'], '9')
+        self.assertEqual(args.kwargs['params']['courBeginTime'], '2026-09-22 00:00:00')
+        self.assertEqual(args.kwargs['params']['courEndTime'], '2026-09-23 23:59:59')
+        self.assertNotIn('liveDay', args.kwargs['params'])
+
+    def test_missing_timetable_and_mismatched_identity_keep_single_cells(self):
+        rows = [record(123+i, subjId=67, clroId=89, acteId=9, letiNumber=3+i,
+                       courBeginTime=f"2026-09-22 {start}", courEndTime=f"2026-09-22 {end}")
+                for i, (start, end) in enumerate([('10:00:00', '10:45:00'),
+                                                  ('10:50:00', '11:35:00')])]
+        for table in (payload([]), {'status': 503}, payload([dict(rows[0], clroId=999), rows[1]])):
+            with self.subTest(table=table):
+                self.response.json.side_effect = [payload(rows), table]
+                courses = self.list({'live_audio': {'continuous': True}})
+                self.assertEqual(len(courses), 2)
+                self.assertTrue(all(not course.lesson_ids for course in courses))
+
     def test_malformed_records_are_ignored_without_exposing_server_text(self):
         invalid = [
             None,

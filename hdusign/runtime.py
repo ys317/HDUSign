@@ -33,6 +33,12 @@ def resource_root() -> Path:
     return Path(getattr(sys, "_MEIPASS", application_root()))
 
 
+def data_root() -> Path:
+    """Only account workers receive this override; assets remain shared read-only."""
+    value = os.environ.get("HDUSIGN_ACCOUNT_ROOT")
+    return Path(value).resolve() if value else application_root()
+
+
 def configure_qt_runtime() -> None:
     """Make bundled Qt dependencies resolvable before importing PySide6."""
     if not getattr(sys, "frozen", False) or os.name != "nt":
@@ -187,6 +193,37 @@ def check_runtime(report_path: str) -> int:
                     report["browser_version"] = cdp.send("Browser.getVersion")["product"]
                     cdp.detach()
                     report["browser_path"] = str(executable.relative_to(resource_root()))
+                    # Exercise packaged login detection on fully intercepted
+                    # pages. No request reaches the school or uses saved logins.
+                    from hdusign.live import _login_candidate, _verify_browser_login
+                    from types import SimpleNamespace
+                    context.unroute("**/*")
+                    requests_seen = []
+                    def offline_page(route):
+                        requests_seen.append(route.request.url)
+                        route.fulfill(status=200, content_type="text/html", body="<title>Offline login check</title>")
+                    context.route("**/*", offline_page)
+                    page.goto("https://course.hdu.edu.cn/#/login", wait_until="domcontentloaded")
+                    page.evaluate("sessionStorage.setItem('RUNTIME_STORAGE_KEY_JWT_TOKEN', 'offline-runtime-token')")
+                    if _login_candidate(page, "https://course.hdu.edu.cn"):
+                        raise RuntimeError("登录页仍尝试使用旧凭据")
+                    page.goto("https://course.hdu.edu.cn/#/list-live", wait_until="domcontentloaded")
+                    if _login_candidate(page, "https://course.hdu.edu.cn") != "offline-runtime-token":
+                        raise RuntimeError("未能读取已登录页面的凭据")
+                    class OfflineUnauthorized:
+                        status = 401
+                        disposed = False
+                        def dispose(self):
+                            self.disposed = True
+                    denied = OfflineUnauthorized()
+                    background = SimpleNamespace(request=SimpleNamespace(get=lambda *a, **kw: denied))
+                    rejected = _verify_browser_login(background, "https://course.hdu.edu.cn", "offline-runtime-token")
+                    if rejected != {"ok": False, "rejected": True} or not denied.disposed:
+                        raise RuntimeError("后台登录失效处理失败")
+                    if any("/v1/currentuser" in url for url in requests_seen):
+                        raise RuntimeError("登录检测仍产生页面内的账号请求")
+                    report["login_detection"] = dict(no_page_fetch=True, login_route_skipped=True,
+                                                     background_401_handled=True, school_requests=0)
                 finally:
                     context.close()
         report.update(ok=True, asr=True, semantic=True, browser=True)

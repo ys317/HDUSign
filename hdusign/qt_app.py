@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from PySide6.QtCore import QPointF, QRectF, QSize, QUrl, Qt, qInstallMessageHandler
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickImageProvider
 from PySide6.QtQuickControls2 import QQuickStyle
@@ -135,20 +135,11 @@ def create_engine(controller, app=None):
     qInstallMessageHandler(forward_message)
     if QQuickStyle.name() != "Basic":
         QQuickStyle.setStyle("Basic")
-    # Load a known system font without enumerating Qt's removed bundled-font
-    # directory. This keeps Chinese glyphs available in the desktop build and
-    # avoids the QFontDatabase warning emitted by PySide6's empty font folder.
+    # Use Windows' installed family and its matching regular/bold faces.
+    # Re-registering only msyh.ttc as an application font shadowed the system
+    # family and reproduced incorrect CJK glyphs in bold headings on Windows.
+    # Do not register or replace the user's system fonts here.
     body = "Microsoft YaHei UI"
-    for candidate in ("C:/Windows/Fonts/Noto Sans SC (TrueType).otf",
-                      "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc"):
-        path = Path(candidate)
-        if not path.is_file():
-            continue
-        font_id = QFontDatabase.addApplicationFont(str(path))
-        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
-        if families:
-            body = families[0]
-            break
     heading = body
     mono = "Cascadia Mono"
     app.setFont(QFont(body, 10))
@@ -157,12 +148,19 @@ def create_engine(controller, app=None):
     engine.warnings.connect(lambda errors: load_errors.extend(error.toString() for error in errors))
     engine.addImageProvider("icons", Icons())
     context = engine.rootContext()
-    context.setContextProperty("appController", controller)
+    manager = controller if hasattr(controller, "active") else None
+    context.setContextProperty("accountManager", manager)
+    context.setContextProperty("appController", manager.active if manager else controller)
+    if manager:
+        manager.activeChanged.connect(lambda: context.setContextProperty("appController", manager.active))
     context.setContextProperty("bodyFont", body)
     context.setContextProperty("headingFont", heading)
     context.setContextProperty("monoFont", mono)
     # In a frozen package QML remains replaceable data next to the Qt libraries.
     qml = resource_root() / "hdusign" / "qml" / "Main.qml"
+    if getattr(sys, "frozen", False):
+        from hdusign import __version__
+        qml = resource_root() / ("qml-" + __version__) / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml)))
     if not engine.rootObjects():
         raise RuntimeError("无法加载 HDUSign Qt Quick 界面：\n" + "\n".join(load_errors))
@@ -176,7 +174,8 @@ def main():
     app.setApplicationName("HDUSign")
     app.setOrganizationName("HDUSign")
     app.setWindowIcon(QIcon(str(resource_root() / "assets" / "hdusign.ico")))
-    controller = Controller()
+    from hdusign.multi_account import AccountManager
+    controller = AccountManager()
     engine, window = create_engine(controller, app)
     app.aboutToQuit.connect(controller.shutdown)
     result = app.exec()
@@ -200,11 +199,47 @@ def check_desktop_runtime():
     controller = engine = None
     try:
         with tempfile.TemporaryDirectory(prefix="hdusign-qt-check-") as temporary:
-            controller = Controller(Path(temporary), auto_load=False)
+            from hdusign.multi_account import AccountManager
+            controller = AccountManager(Path(temporary), auto_load=False)
             engine, window = create_engine(controller, app)
-            controller.consume(["[ASR 00:00:00] 界面离线自检", "[i] 签到码: 0123"])
+            controller.active.consume(["[ASR 00:00:00] 界面离线自检", "[i] 签到码: 0123"])
+            from hdusign.live import LiveCourse, live_course_url
+            import time
+            now = time.time()
+            courses = [LiveCourse(str(700 + i), f"离线预约自检 {i + 1}", now + 3600 + i * 7200,
+                                  now + 6300 + i * 7200) for i in range(3)]
+            current = controller.active
+            if current.form.value("diagnostic") is not True:
+                raise RuntimeError("诊断默认开启自检失败")
+            current.set_courses(courses)
+            for course in courses[:2]:
+                current.selectCourse(live_course_url(course))
+                current.toggleMonitor()
+            current.selectCourse(live_course_url(courses[2]))
+            if current._schedules != courses[:2] or current.state.value("scheduled"):
+                raise RuntimeError("多门预约或浏览分离自检失败")
+            from hdusign.reservation_webhooks import binding, binding_url, webhook_key
+            endpoint = "https://example.invalid/offline-robot-one"
+            spare = "https://example.invalid/offline-robot-two"
+            primary_id = controller.webhooks.remember_verified("离线机器人一", endpoint)
+            controller.webhooks.remember_verified("离线机器人二", spare)
+            controller.bind_webhook(current, primary_id)
+            if not controller.save_robot(current, live_course_url(courses[0]), binding("离线机器人一", endpoint)):
+                raise RuntimeError("课程机器人保存自检失败")
+            current.toggleMonitor()
+            reused = current.cfg.get("reservation_webhooks", {}).get(live_course_url(courses[2]))
+            if binding_url(reused) != endpoint or controller.robotPrompt["visible"]:
+                raise RuntimeError("监听时间不重叠的课程未能复用机器人")
+            # A fourth course overlaps the first; only this one must prompt.
+            overlap = LiveCourse("799", "离线重叠课程", courses[0].start + 600, courses[0].end + 600)
+            current.set_courses([*courses, overlap])
+            current.selectCourse(live_course_url(overlap))
+            current.toggleMonitor()
+            prompt = controller.robotPrompt
+            if not prompt["visible"] or webhook_key(endpoint) in [choice["identity"] for choice in prompt["choices"]]:
+                raise RuntimeError("机器人冲突过滤自检失败")
             for dark in (True, False):
-                controller._publish(dark=dark)
+                controller.active._publish(dark=dark)
                 loop = QEventLoop()
                 QTimer.singleShot(200, loop.quit)
                 loop.exec()
@@ -212,8 +247,19 @@ def check_desktop_runtime():
                     raise RuntimeError("Qt Quick 未生成有效画面")
                 if window.color().name() != ("#191919" if dark else "#ffffff"):
                     raise RuntimeError("Qt Quick 主题绑定失效")
+            controller.confirmRobotChoice(prompt["ticket"], webhook_key(spare))
+            assigned = current.cfg.get("reservation_webhooks", {}).get(live_course_url(overlap))
+            if binding_url(assigned) != spare or controller.robotPrompt["visible"]:
+                raise RuntimeError("冲突后人工选择课程机器人自检失败")
             report = dict(renderer=str(window.rendererInterface().graphicsApi()),
-                          version=__import__('PySide6').__version__, qml=True)
+                          version=__import__('PySide6').__version__, qml=True, multi_account=True,
+                          multiple_reservations=True, browsing_preserves_reservations=True,
+                          diagnostics_default_on=True, per_course_webhooks=True,
+                          webhook_conflict_dialog=True, occupied_webhooks_excluded=True,
+                          nonoverlapping_webhooks_reused=True,
+                          automatic_sign_settings_removed="autoSign" not in current._form)
+            if not report["automatic_sign_settings_removed"]:
+                raise RuntimeError("界面仍包含自动签到设置")
     finally:
         if controller:
             controller.shutdown()

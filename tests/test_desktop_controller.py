@@ -16,7 +16,6 @@ from PySide6.QtTest import QSignalSpy
 from hdusign.desktop_controller import Controller, Rows
 from hdusign.demo import DemoServices, demo_courses, prepare_demo
 from hdusign.live import LiveError, live_course_url
-from hdusign.location import Location
 
 
 APP = QGuiApplication.instance() or QGuiApplication([])
@@ -63,16 +62,10 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(cfg['unexposed'], {'nested': [1, 2]})
         self.assertEqual(cfg['rules']['strong'], ['签到', '请签到'])
         self.assertEqual(secrets['retained'], 'fixture')
-        self.assertEqual(secrets['skl_password'], ' spaces stay ')
+        self.assertNotIn('skl_password', secrets)
+        self.assertNotIn(' spaces stay ', self.c.secrets_path.read_text())
         self.assertNotIn('password', str(cfg))
 
-    def test_invalid_coordinates_never_write(self):
-        original = self.c.config_path.read_bytes()
-        for value in ('NaN', 'inf', '-91', 'abc'):
-            self.c.setField('latitude', value)
-            self.assertFalse(self.c.save())
-            self.assertEqual(self.c._state['errorField'], 'latitude')
-            self.assertEqual(self.c.config_path.read_bytes(), original)
 
     def test_theme_persists_without_saving_unsaved_fields(self):
         self.c.setField('webhook', 'https://example.invalid/unsaved')
@@ -145,7 +138,10 @@ class DesktopControllerTests(unittest.TestCase):
         self.c.toggleMonitor()
         calls = []
         self.c.services.monitor = lambda cfg, stop: (calls.append(cfg), stop.wait(), 0)[-1]
-        with patch('hdusign.desktop_controller.time.time', return_value=course.start + 3):
+        with patch('hdusign.desktop_controller.time.time', return_value=course.start - 121):
+            self.c.tick()
+            self.assertFalse(self.c._task)
+        with patch('hdusign.desktop_controller.time.time', return_value=course.start - 120):
             self.c.tick()
             self.c.tick()
         self.c.stop()
@@ -156,10 +152,49 @@ class DesktopControllerTests(unittest.TestCase):
     def test_expired_schedule_never_starts(self):
         course = self.select(future=True)
         self.c.toggleMonitor()
-        with patch('hdusign.desktop_controller.time.time', return_value=course.end + 1):
+        with patch('hdusign.desktop_controller.time.time', return_value=course.end + 120):
             self.c.tick()
         self.assertIsNone(self.c._scheduled)
         self.assertFalse(self.c._task)
+
+    def test_continuous_course_snapshot_is_passed_to_monitor(self):
+        from hdusign.lessons import group_lessons
+        from test_lessons import lessons
+        course = group_lessons(lessons())[0]
+        self.c.set_courses([course])
+        self.c.selectCourse(live_course_url(course))
+        captured = []
+        self.c.services.monitor = lambda cfg, stop: captured.append(cfg)
+        self.assertTrue(self.c.start_monitor())
+        self.complete()
+        self.assertEqual(captured[0]['continuous_course']['lesson_ids'], ('123', '124', '125'))
+        self.assertEqual(self.c.course_model.items[0]['fullTime'], '10-20 10:00–12:25')
+
+    def test_restored_continuous_schedule_keeps_plan_without_refreshed_list(self):
+        from hdusign.lessons import group_lessons
+        from test_lessons import lessons
+        course = group_lessons(lessons())[0]
+        self.c.set_courses([course])
+        self.c.selectCourse(live_course_url(course))
+        # The fixture uses a fixed date. Restore it under the same virtual time
+        # used for its scheduled start rather than letting real time expire it.
+        with patch('hdusign.desktop_controller.time.time', return_value=course.start - 3600):
+            self.c.toggleMonitor()
+            other = Controller(self.root, DemoServices(), auto_load=False)
+        other.shutdown()
+        self.assertEqual(other._scheduled, course)
+        captured = []
+        other.services.monitor = lambda cfg, stop: captured.append(cfg)
+        with patch('hdusign.desktop_controller.time.time', return_value=course.start - 121):
+            self.c.tick()
+            self.assertFalse(self.c._task)
+        with patch('hdusign.desktop_controller.time.time', return_value=course.start - 120):
+            other.tick()
+        if other.worker:
+            other.worker.join(2)
+        other.drain()
+        self.assertEqual(captured[0]['continuous_course']['lesson_ids'], ('123', '124', '125'))
+        other.shutdown()
 
     def test_cancel_failure_preserves_scheduled_account(self):
         self.select(future=True)
@@ -225,12 +260,6 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertFalse(self.c._task)
         self.assertEqual(self.c._state['code'], '0042')
 
-    def test_location_does_not_overwrite_edits_made_during_request(self):
-        self.c._location_request = (self.c._form['latitude'], self.c._form['longitude'])
-        self.c.setField('latitude', '20.1')
-        self.c._finish('locate', False, Location(30.1, 120.2, 5))
-        self.assertEqual(self.c._form['latitude'], '20.1')
-        self.assertIn('保留', self.c._state['locationHint'])
 
     def test_course_limit_remains_safe_during_tick(self):
         self.c.course_model.limit = 2

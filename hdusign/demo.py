@@ -25,7 +25,6 @@ def prepare_demo(root):
     cfg["live_url"] = live_course_url(demo_courses()[0])
     cfg["alert"]["webhook"]["url"] = ""
     cfg["rules"]["semantic"]["enabled"] = False
-    cfg["auto_sign"]["enabled"] = False
     cfg["ui"] = {"appearance": "dark"}
     (root / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     (root / "secrets_local.json").write_text(json.dumps({
@@ -40,7 +39,7 @@ class DemoServices:
             "[ASR 10:00:01] 同学们，今天继续学习上一节的内容。",
             "[ASR 10:00:04] 现在开始签到，签到码是二三三零。",
             "[i] 签到提醒：检测到签到码: 2330",
-            "[i] 自动签到已关闭，请在课堂页面自行确认。",
+            "[i] 已识别签到码，请在课堂页面自行确认。",
         ):
             print(line)
         stop.wait()
@@ -56,7 +55,7 @@ class DemoServices:
         print("[i] 演示模式：未调用外部服务。")
         return 0
 
-    locate = signin = webhook = _offline
+    webhook = _offline
 
 
 class DemoController(Controller):

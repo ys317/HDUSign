@@ -131,7 +131,6 @@ class StableCodeTests(unittest.TestCase):
 
     def replay(self, results, tail=()):
         clock = AudioClock()
-        signer = Mock()
         asr = Mock()
         asr.accept.side_effect = results
         asr.flush.return_value = list(tail)
@@ -139,11 +138,11 @@ class StableCodeTests(unittest.TestCase):
             alerter = Alerter(str(Path(directory) / "alerts.jsonl"), clock=clock)
             watcher = make_watcher(
                 {"code_watch": {"log_file": str(Path(directory) / "codes.jsonl")}},
-                alerter, signer, clock=clock)
+                alerter, clock=clock)
             chunks = [np.zeros(4000, dtype=np.float32) for _ in results]
             run_pipeline(clock.advance(chunks), asr, [RuleMatcher(["签到"], [])],
                          alerter, watcher, show_partial=False, clock=clock)
-            return [call.args[0] for call in signer.submit.call_args_list], watcher.codes_found
+            return [code for code, _ in watcher.codes_found], watcher.codes_found
 
     def test_partial_four_digits_never_submit_a_five_digit_or_phone_prefix(self):
         for prefix, final in (("一八三六", "一八三六二"),
