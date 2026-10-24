@@ -66,20 +66,19 @@ class LiveMonitorTests(unittest.TestCase):
         source.return_value.chunks.side_effect = factory or self.successful_frames
         source.return_value.discontinuities = 0
         source.return_value.skipped_seconds = 0.0
-        alerter, signer, asr, watcher = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+        alerter, code_observer, asr, watcher = MagicMock(), MagicMock(), MagicMock(), MagicMock()
         asr.accept.return_value = ([], "签到码一二三四")
         asr.revision = 1
         watcher.feed_partial.return_value = []
         stack.enter_context(patch.object(monitor, "make_alerter", return_value=alerter))
-        make_signer = stack.enter_context(patch.object(monitor, "make_auto_signer", return_value=signer))
         make_asr = stack.enter_context(patch.object(monitor, "make_engine", return_value=asr))
         stack.enter_context(patch.object(monitor, "build_matchers", return_value=[]))
         stack.enter_context(patch.object(monitor, "make_watcher", return_value=watcher))
         output = StringIO()
         stack.enter_context(redirect_stdout(output))
         return SimpleNamespace(client=client, stream=stream, constructor=constructor, source=source,
-                               alerter=alerter, signer=signer, asr=asr, watcher=watcher,
-                               make_asr=make_asr, make_signer=make_signer, output=output)
+                               alerter=alerter, code_observer=code_observer, asr=asr, watcher=watcher,
+                               make_asr=make_asr, output=output)
 
     def test_direct_mode_does_not_start_a_loopback_capture(self):
         with patch.object(monitor, "cmd_run_live") as direct, patch.object(monitor, "LoopbackSource") as speaker:
@@ -112,8 +111,7 @@ class LiveMonitorTests(unittest.TestCase):
         self.assertEqual(f.watcher.discard_partial.call_count, 7)
         f.asr.flush.assert_not_called()
         f.alerter.notify.assert_not_called()
-        f.signer.submit.assert_not_called()
-        f.signer.close.assert_called_once()
+        f.code_observer.confirmed.assert_not_called()
         f.client.__exit__.assert_called_once()
         f.constructor.assert_called_once_with(self.cfg["live_url"], self.cfg)
 
@@ -128,18 +126,6 @@ class LiveMonitorTests(unittest.TestCase):
         f.make_asr.assert_called_once()
         f.source.assert_called_once()
 
-    def test_signin_page_prepares_before_live_lookup_and_reuses_the_session(self):
-        with ExitStack() as stack:
-            f = self.setup_pipeline(stack)
-            def resolve():
-                f.signer.prepare.assert_called_once()
-                f.make_asr.assert_not_called()
-                f.signer.submit.assert_not_called()
-                return f.stream
-            f.client.resolve.side_effect = resolve
-            monitor.cmd_run_live(self.cfg, self.stop)
-        f.signer.prepare.assert_called_once()
-        f.signer.close.assert_called_once()
 
     def test_api_outage_during_reconnect_is_inside_the_recovery_window(self):
         connections = []
@@ -208,7 +194,6 @@ class LiveMonitorTests(unittest.TestCase):
                 monitor.cmd_run_live(self.cfg, self.stop)
         f.source.assert_called_once()
         self.assertEqual(self.stop.waits, [])
-        f.signer.close.assert_called_once()
         f.asr.flush.assert_not_called()
 
     def test_slow_trickle_during_recovery_cannot_exceed_its_deadline(self):
@@ -268,9 +253,7 @@ class LiveMonitorTests(unittest.TestCase):
                     monitor.cmd_run_live(self.cfg, self.stop)
                 f.source.assert_not_called()
                 f.make_asr.assert_not_called()
-                f.signer.prepare.assert_called_once()
-                f.signer.submit.assert_not_called()
-                f.signer.close.assert_called_once()
+                f.code_observer.confirmed.assert_not_called()
         self.assertEqual(self.stop.waits, [])
 
     def test_expired_login_during_recovery_does_not_open_a_browser_or_retry(self):
@@ -283,7 +266,6 @@ class LiveMonitorTests(unittest.TestCase):
             login.assert_not_called()
         self.assertEqual(self.stop.waits, [2])
         f.source.assert_called_once()
-        f.signer.close.assert_called_once()
 
     def test_known_course_end_returns_normally_without_switching_courses(self):
         with ExitStack() as stack:
@@ -318,7 +300,6 @@ class LiveMonitorTests(unittest.TestCase):
         self.assertEqual(f.client.resolve.call_count, 3)
         self.assertEqual(f.source.call_count, 2)
         self.assertEqual(self.stop.waits, [2, 5])
-        f.signer.close.assert_called_once()
 
     def test_stop_during_backoff_opens_no_further_connection(self):
         with ExitStack() as stack:
@@ -327,7 +308,6 @@ class LiveMonitorTests(unittest.TestCase):
             monitor.cmd_run_live(self.cfg, self.stop)
         f.client.resolve.assert_called_once()
         f.source.assert_called_once()
-        f.signer.close.assert_called_once()
         f.asr.flush.assert_not_called()
         self.assertEqual(self.clock.now, 0)
 
@@ -345,7 +325,7 @@ class LiveMonitorTests(unittest.TestCase):
         f.source.assert_not_called()
         f.client.__exit__.assert_called_once()
 
-    def test_stopping_closes_the_audio_source_and_attendance_worker(self):
+    def test_stopping_closes_the_audio_source(self):
         closed = []
 
         def frames(stop):
@@ -361,9 +341,8 @@ class LiveMonitorTests(unittest.TestCase):
         self.assertEqual(closed, [True])
         f.client.resolve.assert_called_once()
         f.source.assert_called_once()
-        f.signer.close.assert_called_once()
         f.asr.flush.assert_not_called()
-        f.signer.submit.assert_not_called()
+        f.code_observer.confirmed.assert_not_called()
 
     def test_audio_fragments_on_opposite_sides_of_a_gap_cannot_form_a_signin_code(self):
         connections = []
@@ -393,12 +372,12 @@ class LiveMonitorTests(unittest.TestCase):
         with ExitStack() as stack:
             f = self.setup_pipeline(stack, frames)
             watcher = SignInWatcher(log_file=os.devnull, early_code=True)
-            watcher.on_code = lambda code, _: f.signer.submit(code)
+            watcher.on_code = lambda code, _: f.code_observer.confirmed(code)
             stack.enter_context(patch.object(monitor, "make_engine", return_value=Recognizer()))
             stack.enter_context(patch.object(monitor, "make_watcher", return_value=watcher))
             stack.enter_context(patch.object(monitor, "build_matchers", return_value=[RuleMatcher(["签到"], [])]))
             monitor.cmd_run_live(self.cfg, self.stop)
-        f.signer.submit.assert_not_called()
+        f.code_observer.confirmed.assert_not_called()
         self.assertEqual(watcher.codes_found, [])
         self.assertEqual(len(connections), 2)
 
@@ -435,14 +414,14 @@ class LiveMonitorTests(unittest.TestCase):
             f = self.setup_pipeline(stack, frames)
             recognizer = Recognizer()
             watcher = SignInWatcher(log_file=os.devnull, early_code=True)
-            watcher.on_code = lambda code, _: f.signer.submit(code)
+            watcher.on_code = lambda code, _: f.code_observer.confirmed(code)
             stack.enter_context(patch.object(monitor, "make_engine", return_value=recognizer))
             stack.enter_context(patch.object(monitor, "make_watcher", return_value=watcher))
             stack.enter_context(patch.object(monitor, "build_matchers", return_value=[RuleMatcher(["签到"], [])]))
             monitor.cmd_run_live(self.cfg, self.stop)
         self.assertEqual(recognizer.restarts, 1)
         self.assertEqual([code for code, _ in watcher.codes_found], ["5678"])
-        f.signer.submit.assert_called_once_with("5678")
+        f.code_observer.confirmed.assert_called_once_with("5678")
         f.source.assert_called_once()
         f.client.resolve.assert_called_once()
         self.assertEqual(self.stop.waits, [])

@@ -15,7 +15,7 @@ import queue
 import re
 import threading
 import time
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, nullcontext
 from urllib.parse import urlparse
 
 import yaml
@@ -25,12 +25,19 @@ from PySide6.QtCore import QUrl
 from PySide6.QtQml import QQmlPropertyMap
 
 from hdusign import __version__
+from hdusign.accounts import AccountStore, load_credentials, protect, session_credentials
 from hdusign.live import LiveCourse, LiveError, live_course_url, parse_live_origin, parse_live_page
-from hdusign.location import DEFAULT_LAT, DEFAULT_LNG, Location
 from hdusign.runtime import application_root, resource_root
 
 ZONE = dt.timezone(dt.timedelta(hours=8))
-START_DELAY = 2.0
+from hdusign.lessons import EARLY_START, LATE_END
+
+START_DELAY = -EARLY_START
+
+COURSE_VIEW = dict(status="未开始", statusKind="idle", elapsed="00:00:00",
+                   timerLabel="已运行时长", transcript="等待开始",
+                   transcriptHint="选择课程后开始监控。", transcriptFinal=False,
+                   code="", copied=False)
 
 
 class Rows(QAbstractListModel):
@@ -93,6 +100,9 @@ class Services:
 
     def courses(self, cfg, stop):
         from hdusign.live import list_live_courses
+        options = dict(cfg.get("live_audio") or {})
+        options.setdefault("continuous", True)
+        cfg = dict(cfg, live_audio=options)
         return list_live_courses(cfg, stop=stop)
 
     def login(self, url, stop, credentials, manual=False):
@@ -100,13 +110,7 @@ class Services:
         return login_live(url, stop, switch_account=manual,
                           credentials=None if manual else credentials)
 
-    def signin(self, cfg, stop):
-        from hdusign.browser import login
-        return login(stop=stop)
 
-    def locate(self, cfg, stop):
-        from hdusign.location import get_current_location
-        return get_current_location()
 
     def webhook(self, cfg, stop):
         from hdusign.monitor import cmd_webhook_test
@@ -168,27 +172,48 @@ class Controller(QObject):
                            actionText="开始监控", actionIcon="play",
                            destructive=False, busy=False, monitoring=False, stopping=False,
                            closing=False, needsLogin=False, copied=False, scheduled=False,
-                           locationHint="核对坐标后保存。", dirty=False)
+                           accountMonitoring=False, reservationCount=0, runningTitle="", runningUrl="",
+                           runningRobotName="", runningRobotPending=False,
+                           dirty=False)
         error = ""
         try:
             self.cfg = read_mapping(self.config_path if self.config_path.exists()
                                     else resource_root() / "config.example.yaml")
-            self.secrets = read_mapping(self.secrets_path)
+            self.account_store = AccountStore(self.root)
+            self.secrets = load_credentials(self.root, use_session=False)
+            # Migrate a legacy plaintext password without declaring it verified.
+            legacy = read_mapping(self.secrets_path)
+            if "skl_password" in legacy:
+                legacy["skl_password_dpapi"] = protect(str(legacy.pop("skl_password")))
+                write_text_atomic(self.secrets_path, json.dumps(legacy, ensure_ascii=False, indent=2))
         except (OSError, ValueError, yaml.YAMLError) as exc:
             self.cfg, self.secrets = {}, {}
+            self.account_store = None
             error = f"读取设置失败：{exc}"
+        if not error and (self.cfg.get("diagnostics") or {}).get("default_on_applied") is not True:
+            # Enable existing accounts once on upgrade. Persist the marker with
+            # the setting so a later explicit opt-out survives every restart.
+            upgraded = copy.deepcopy(self.cfg)
+            upgraded.setdefault("diagnostics", {}).update(enabled=True, default_on_applied=True)
+            try:
+                write_text_atomic(self.config_path, yaml.safe_dump(upgraded, allow_unicode=True, sort_keys=False))
+            except OSError:
+                error = "诊断默认设置保存失败，已保留原设置；请检查配置目录写入权限。"
+            else:
+                self.cfg = upgraded
         self._state["dark"] = self.cfg.get("ui", {}).get("appearance", "dark") != "light"
         self._form = dict(
             url=str(self.cfg.get("live_url", "")),
             username=str(self.secrets.get("skl_username", "")),
             password=str(self.secrets.get("skl_password", "")),
+            remember=True,
+            webhookName="",
             webhook=str(self.cfg.get("alert", {}).get("webhook", {}).get("url", "") or ""),
-            latitude=str(self.cfg.get("location", {}).get("lat", DEFAULT_LAT)),
-            longitude=str(self.cfg.get("location", {}).get("lng", DEFAULT_LNG)),
             live=bool(self.cfg.get("live_audio", {}).get("enabled", True)),
-            autoSign=bool(self.cfg.get("auto_sign", {}).get("enabled", True)),
             semantic=bool(self.cfg.get("rules", {}).get("semantic", {}).get("enabled", False)),
+            diagnostic=bool(self.cfg.get("diagnostics", {}).get("enabled", True)),
             rules="\n".join(str(s) for s in self.cfg.get("rules", {}).get("strong", [])))
+        self._login_snapshot = None
         self._saved_form = dict(self._form)
         self._state['selectedUrl'] = self._form['url'].strip()
         # Each QML dependency observes its own key. A timer/transcript update
@@ -205,7 +230,12 @@ class Controller(QObject):
         self.log_model = Rows(1500, self)
         self.activity_model = Rows(20, self)
         self._courses = []
-        self._scheduled = None
+        self._schedules = []
+        self._monitor_url = None
+        self._monitor_course = None
+        self._course_views = {}
+        self._course_logs = {}
+        self._course_activity = {}
         self._task = ""
         self.worker = None
         self.stop_event = threading.Event()
@@ -254,6 +284,53 @@ class Controller(QObject):
     def activity(self):
         return self.activity_model
 
+    @property
+    def _scheduled(self):
+        """The next reservation, for account summaries and older integrations."""
+        return self._schedules[0] if self._schedules else None
+
+    @Property("QVariantList", notify=changed)
+    def reservations(self):
+        return [self._course_row(course) for course in self._schedules]
+
+    def _find_course(self, url):
+        return next((c for c in [*self._courses, *self._schedules,
+                                 *([self._monitor_course] if self._monitor_course else [])]
+                     if live_course_url(c) == url), None)
+
+    def _reserved(self, url=None):
+        url = self._state["selectedUrl"] if url is None else url
+        return next((c for c in self._schedules if live_course_url(c) == url), None)
+
+    def _task_publish(self, **values):
+        # A background task always owns its original course, even when the user
+        # is viewing or booking another one. Only visible-course data reaches QML.
+        url = self._monitor_url
+        if url is None:
+            self._course_views.setdefault(self._state["selectedUrl"], dict(COURSE_VIEW)).update(values)
+            self._publish(**values)
+            return
+        self._course_views.setdefault(url, dict(COURSE_VIEW)).update(values)
+        if url == self._state["selectedUrl"]:
+            self._publish(**values)
+        else:
+            self.changed.emit()
+
+    def _show_course(self):
+        url = self._state["selectedUrl"]
+        self._publish(**self._course_views.get(url, COURSE_VIEW))
+        self.log_model.reset(self._course_logs.get(url, ()))
+        self.activity_model.reset(self._course_activity.get(url, ()))
+        self._show_schedule()
+        self._action()
+
+    def _refresh_reservations(self):
+        for row, course in enumerate(self._courses):
+            self.course_model.update(row, self._course_row(course))
+        self._publish(reservationCount=len(self._schedules))
+        self.changed.emit()
+        self._action()
+
     def _publish(self, **values):
         if "selectedUrl" in values:
             values.update(self._course_details(values["selectedUrl"]))
@@ -278,14 +355,16 @@ class Controller(QObject):
     def setField(self, key, value):
         if key not in self._form or self._state["closing"]:
             return
-        if self._task and key in ("username", "password"):
+        if self._task and key in ("username", "password", "remember"):
             return
-        value = bool(value) if key in ("live", "autoSign", "semantic") else str(value)
+        value = bool(value) if key in ("live", "semantic", "remember", "diagnostic") else str(value)
         if self._form[key] == value:
             return
-        if key in ("username", "password", "url", "live") and self._scheduled:
-            if not self.cancelSchedule():
+        if key in ("username", "password") and self._scheduled:
+            if not self._persist_schedule([]):
                 return
+            self._schedules = []
+            self._refresh_reservations()
         self._form[key] = value
         if key in ("username", "password"):
             self._courses = []
@@ -296,40 +375,75 @@ class Controller(QObject):
                           courseHint="账号已修改，请登录并读取课程。")
         elif key == "url":
             self._publish(selectedUrl=value.strip())
+            self._show_course()
         self.formChanged.emit()
         self._publish(dirty=self._form != self._saved_form, feedback="有未保存的更改",
                       feedbackError=False, errorField="")
         self._action()
 
+    @Property("QVariantList", notify=changed)
+    def savedAccounts(self):
+        return sorted(self.account_store.accounts) if self.account_store else []
+
+    @Slot(str)
+    def selectAccount(self, username):
+        if self._task or self._state["closing"] or not self.account_store:
+            return
+        try:
+            password = self.account_store.password(username) if username else ""
+        except (OSError, ValueError, KeyError):
+            self._feedback("保存的密码无法读取，请重新输入并登录。", True)
+            return
+        self.setField("username", username)
+        self.setField("password", password)
+        self.setField("remember", True)
+        self._feedback("已填入账号，点击登录即可。" if username else "请输入新账号并登录。")
+
+    @Slot(str)
+    def deleteAccount(self, username):
+        if self._task or self._state["closing"] or not self.account_store:
+            return
+        if username not in self.account_store.accounts:
+            return
+        if self._scheduled:
+            if not self._persist_schedule([]):
+                return
+            self._schedules = []
+        try:
+            self.account_store.delete(username)
+        except (OSError, ValueError):
+            self._feedback("删除未完成，请关闭该账号的浏览器窗口后重试。", True)
+            return
+        if self._form["username"].strip() == username:
+            self.setField("username", "")
+            self.setField("password", "")
+            self.secrets.update(skl_username="", skl_password="")
+            session_credentials(self.root, self.secrets)
+        self.changed.emit()
+        self._feedback("账号及其浏览器登录状态已删除。")
+
     @Slot(result=bool)
     def save(self):
-        coords = {}
-        for key, title, limit in (("latitude", "纬度", 90), ("longitude", "经度", 180)):
-            try:
-                number = float(self._form[key].strip())
-                if not math.isfinite(number) or abs(number) > limit:
-                    raise ValueError
-            except ValueError:
-                self._feedback(f"{title}须为 {-limit} 到 {limit} 的数字", True, key)
-                return False
-            coords["lat" if key == "latitude" else "lng"] = number
         cfg, secrets = copy.deepcopy(self.cfg), copy.deepcopy(self.secrets)
         cfg["live_url"] = self._form["url"].strip()
         cfg.setdefault("ui", {})["appearance"] = "dark" if self._state["dark"] else "light"
         cfg.setdefault("live_audio", {})["enabled"] = self._form["live"]
         cfg.setdefault("alert", {}).setdefault("webhook", {})["url"] = self._form["webhook"].strip()
-        cfg.setdefault("auto_sign", {})["enabled"] = self._form["autoSign"]
-        cfg.setdefault("location", {}).update(coords)
+        cfg.pop("auto_sign", None)
+        cfg.pop("location", None)
         cfg.setdefault("rules", {}).setdefault("semantic", {})["enabled"] = self._form["semantic"]
+        cfg.setdefault("diagnostics", {})["enabled"] = self._form["diagnostic"]
         cfg["rules"]["strong"] = [s.strip() for s in self._form["rules"].splitlines() if s.strip()]
-        if self._scheduled:
-            cfg["scheduled_course"] = asdict(self._scheduled)
-        else:
-            cfg.pop("scheduled_course", None)
+        self._schedule_config(cfg, self._schedules)
         secrets.update(skl_username=self._form["username"].strip(), skl_password=self._form["password"])
         try:
             write_text_atomic(self.config_path, yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
-            write_text_atomic(self.secrets_path, json.dumps(secrets, ensure_ascii=False, indent=2))
+            disk_secrets = read_mapping(self.secrets_path)
+            # General settings never save unverified edits to account credentials.
+            disk_secrets.update({k: v for k, v in secrets.items()
+                                 if k not in ("skl_username", "skl_password", "skl_password_dpapi")})
+            write_text_atomic(self.secrets_path, json.dumps(disk_secrets, ensure_ascii=False, indent=2))
+            self._set_session_credentials(secrets)
         except OSError as exc:
             self._feedback(f"保存失败：{exc.strerror or '无法写入配置'}", True)
             return False
@@ -337,6 +451,9 @@ class Controller(QObject):
         self._saved_form = dict(self._form)
         self._publish(dirty=False, feedback="设置已保存", feedbackError=False, errorField="")
         return True
+
+    def _set_session_credentials(self, secrets):
+        session_credentials(self.root, secrets)
 
     @Slot()
     def toggleTheme(self):
@@ -361,13 +478,12 @@ class Controller(QObject):
                     summary=" · ".join(filter(None, (phase, day, course.teacher))),
                     detail=" · ".join(filter(None, (course.classroom, course.section))),
                     active=phase == "进行中", start=course.start, end=course.end,
+                    reserved=bool(self._reserved(live_course_url(course))),
+                    monitoring=self._task == "monitor" and self._monitor_url == live_course_url(course),
                     fullTime=f"{start:%m-%d %H:%M}–{end:%H:%M}")
 
     def _course_details(self, url):
-        course = next((c for c in getattr(self, "_courses", ()) if live_course_url(c) == url), None)
-        scheduled = getattr(self, "_scheduled", None)
-        if course is None and scheduled and live_course_url(scheduled) == url:
-            course = scheduled
+        course = self._find_course(url)
         if course is None:
             return dict(courseTitle="", courseSubtitle="")
         row = self._course_row(course)
@@ -379,26 +495,26 @@ class Controller(QObject):
         self.course_model.reset(self._course_row(c) for c in self._courses)
         self._publish(**self._course_details(self._state["selectedUrl"]),
                       courseLoadState="ready" if self._courses else "empty", courseError="",
-                      courseHint=f"找到 {len(self._courses)} 节今明直播课，选择后可监控或预约。" if self._courses
+                      courseHint=f"找到 {len(self._courses)} 堂今明直播课，连堂课将持续监控至最后一节。" if self._courses
                       else "今明没有可选择的直播课，可刷新或在设置中填写网址。")
         self._action()
 
     def _selected(self):
-        return next((c for c in self._courses if live_course_url(c) == self._form["url"].strip()), None)
+        return self._find_course(self._form["url"].strip())
 
     @Slot(str)
     def selectCourse(self, url):
-        if self._task or self._state["closing"]:
+        if (self._task and self._task != "monitor") or self._state["closing"]:
             return
-        course = next((c for c in self._courses if live_course_url(c) == url), None)
-        if not course or self._scheduled and not self.cancelSchedule():
+        course = self._find_course(url)
+        if not course:
             return
         self._form.update(url=url, live=True)
         self.formChanged.emit()
         row = self._course_row(course)
         self._publish(selectedUrl=url, courseHint=f"{row['fullTime']}  {row['detail']}",
                       dirty=self._form != self._saved_form)
-        self._action()
+        self._show_course()
 
     @Slot()
     def load_saved_courses(self):
@@ -413,8 +529,9 @@ class Controller(QObject):
             return
         if "username" in saved and saved["username"] != self._form["username"].strip():
             self._publish(needsLogin=True, courseHint="保存的登录属于其他账号，请重新登录。")
-            if self._scheduled:
-                self.cancelSchedule()
+            if self._scheduled and self._persist_schedule([]):
+                self._schedules = []
+                self._refresh_reservations()
             return
         self.refreshCourses()
 
@@ -441,7 +558,7 @@ class Controller(QObject):
                 if not self._form[key].strip():
                     self._feedback(f"请输入{caption}", True, key)
                     return
-        if self._scheduled and not self.cancelSchedule() or not self.save():
+        if not self.save():
             return
         url = self._form["url"].strip()
         try:
@@ -449,6 +566,7 @@ class Controller(QObject):
         except LiveError:
             url = "https://course.hdu.edu.cn/#/home"
         credentials = copy.deepcopy(self.secrets)
+        self._login_snapshot = (credentials, self._form["remember"], manual)
         self._courses = []
         self.course_model.reset()
         self._form["url"] = ""
@@ -459,40 +577,63 @@ class Controller(QObject):
 
     def _action(self):
         selected = self._selected()
-        future = selected is not None and selected.start > time.time()
-        monitoring = self._task == "monitor"
+        future = selected is not None and selected.start + START_DELAY > time.time()
+        monitoring = self._task == "monitor" and (
+            self._monitor_url is None or self._monitor_url == self._state["selectedUrl"])
+        reserved = bool(self._reserved())
         closing, stopping = self._state["closing"], self._state["stopping"]
-        text = ("正在关闭…" if closing else "正在停止…" if stopping else "停止监控" if monitoring
-                else "取消预约" if self._scheduled else "预约直播" if future else "开始监控")
-        self._publish(actionText=text, actionIcon="stop" if monitoring else "clock" if future or self._scheduled else "play",
-                      destructive=monitoring or bool(self._scheduled), busy=bool(self._task),
-                      monitoring=monitoring, scheduled=bool(self._scheduled))
+        text = ("正在关闭…" if closing else "正在停止…" if stopping and monitoring else "停止监控" if monitoring
+                else "取消预约" if reserved else "预约直播" if future else "开始监控")
+        self._publish(actionText=text, actionIcon="stop" if monitoring else "clock" if future or reserved else "play",
+                      destructive=monitoring or reserved, busy=bool(self._task),
+                      monitoring=monitoring, scheduled=reserved, accountMonitoring=self._task == "monitor")
 
     def _restore_schedule(self):
-        value = self.cfg.get("scheduled_course")
-        if not isinstance(value, dict):
-            return
-        try:
-            data = dict(value, start=float(value["start"]), end=float(value["end"]))
-            course = LiveCourse(**data)
-            if not math.isfinite(course.start) or not math.isfinite(course.end) or course.end <= max(course.start, time.time()):
-                raise ValueError
-            url = live_course_url(course)
-        except (TypeError, ValueError, KeyError, LiveError):
-            self._persist_schedule(None)
-            return
-        self._scheduled = course
-        self._form.update(url=url, live=True)
-        self._saved_form = dict(self._form)
-        self.formChanged.emit()
+        legacy = "scheduled_courses" not in self.cfg and "scheduled_course" in self.cfg
+        values = self.cfg.get("scheduled_courses", [self.cfg["scheduled_course"]] if legacy else [])
+        courses = {}
+        for value in values if isinstance(values, list) else []:
+            try:
+                data = dict(value, start=float(value["start"]), end=float(value["end"]))
+                course = LiveCourse(**data)
+                if not math.isfinite(course.start) or not math.isfinite(course.end) or (
+                        course.end <= course.start or course.end + LATE_END <= time.time()):
+                    continue
+                courses[live_course_url(course)] = course
+            except (TypeError, ValueError, KeyError, LiveError):
+                continue
+        self._schedules = sorted(courses.values(), key=lambda c: c.start)
+        if legacy or values != [asdict(c) for c in self._schedules]:
+            self._persist_schedule(self._schedules)
+        if self._schedules and not self._find_course(self._form["url"].strip()):
+            url = live_course_url(self._schedules[0])
+            self._form.update(url=url, live=True)
+            self._saved_form = dict(self._form)
+            self._publish(selectedUrl=url)
+            self.formChanged.emit()
+        self._refresh_reservations()
         self._show_schedule()
 
-    def _persist_schedule(self, course):
-        cfg = copy.deepcopy(self.cfg)
-        if course:
-            cfg["scheduled_course"] = asdict(course)
+    @staticmethod
+    def _schedule_config(cfg, courses):
+        # Read the old singleton on upgrade, but never leave a stale singleton
+        # that another code path could mistake for the current queue.
+        cfg.pop("scheduled_course", None)
+        if courses:
+            cfg["scheduled_courses"] = [asdict(course) for course in courses]
         else:
-            cfg.pop("scheduled_course", None)
+            cfg.pop("scheduled_courses", None)
+        bindings = cfg.get("reservation_webhooks") or {}
+        retained = {live_course_url(course): bindings[live_course_url(course)]
+                    for course in courses if live_course_url(course) in bindings}
+        if retained:
+            cfg["reservation_webhooks"] = retained
+        else:
+            cfg.pop("reservation_webhooks", None)
+
+    def _persist_schedule(self, courses):
+        cfg = copy.deepcopy(self.cfg)
+        self._schedule_config(cfg, courses)
         try:
             write_text_atomic(self.config_path, yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
         except OSError:
@@ -502,9 +643,11 @@ class Controller(QObject):
         return True
 
     def _show_schedule(self):
-        course = self._scheduled
+        course = self._reserved()
+        if not course or self._task == "monitor" and self._monitor_url == live_course_url(course):
+            return
         row = self._course_row(course)
-        self._publish(status="已预约", statusKind="waiting", timerLabel="距离开课",
+        self._publish(status="已预约", statusKind="waiting", timerLabel="距离监听",
                       selectedUrl=row["url"], transcript=f"等待 {course.title} 开始",
                       transcriptFinal=False, transcriptHint=f"{row['fullTime']} · 预约已保存，请保持软件运行。")
         self._action()
@@ -512,69 +655,122 @@ class Controller(QObject):
 
     @Slot(result=bool)
     def cancelSchedule(self):
-        if not self._scheduled:
+        return self._cancel_reservation(self._state["selectedUrl"])
+
+    @Slot(str)
+    def cancelReservation(self, url):
+        if not self._state["closing"]:
+            self._cancel_reservation(url)
+
+    def _cancel_reservation(self, url):
+        if not self._reserved(url):
             return True
-        if not self._persist_schedule(None):
+        remaining = [c for c in self._schedules if live_course_url(c) != url]
+        if not self._persist_schedule(remaining):
             return False
-        self._scheduled = None
-        self._publish(status="就绪", statusKind="idle", timerLabel="已运行时长", elapsed="00:00:00",
-                      transcriptHint="预约已取消。")
-        self._action()
+        self._schedules = remaining
+        if self._state["selectedUrl"] == url:
+            self._show_course()
+            self._publish(transcriptHint="预约已取消。")
+        self._refresh_reservations()
         return True
 
     @Slot()
     def toggleMonitor(self):
-        if self._task == "monitor":
+        if self._task == "monitor" and self._state["monitoring"]:
             self.stop()
-        elif not self._task and not self._state["closing"]:
-            if self._scheduled:
+        elif (not self._task or self._task == "monitor") and not self._state["closing"]:
+            if self._reserved():
                 self.cancelSchedule()
                 return
             selected = self._selected()
-            if selected and selected.start > time.time():
-                self._scheduled = selected
-                if not self.save():
-                    self._scheduled = None
-                    return
-                self._show_schedule()
+            if selected and selected.start + START_DELAY > time.time():
+                self._reserve_course(selected)
             else:
                 self.start_monitor()
 
-    def start_monitor(self):
+    def _reserve_course(self, course, webhook=None):
+        if self._state["closing"] or self._reserved(live_course_url(course)):
+            return False
+        previous, previous_cfg = self._schedules, copy.deepcopy(self.cfg)
+        if webhook is not None:
+            self.cfg.setdefault("reservation_webhooks", {})[live_course_url(course)] = copy.deepcopy(webhook)
+        self._schedules = sorted([*previous, course], key=lambda c: c.start)
+        if not self.save():
+            self._schedules, self.cfg = previous, previous_cfg
+            return False
+        self._refresh_reservations()
+        self._show_schedule()
+        return True
+
+    def _configure_monitor(self, cfg, course, url):
+        """Managed accounts override the notification route for this one task."""
+
+    def start_monitor(self, course=None):
         if self._task or self._state["closing"]:
             return False
-        if self._form["live"]:
+        url = live_course_url(course) if course else self._form["url"].strip()
+        if course or self._form["live"]:
             if self._state["needsLogin"]:
                 self._feedback("账号已更改，请先登录并读取课程", True, "username")
                 return False
             try:
-                parse_live_page(self._form["url"].strip())
+                parse_live_page(url)
             except LiveError as exc:
                 self._feedback(str(exc), True, "url")
                 return False
         if not self.save():
             return False
         cfg = copy.deepcopy(self.cfg)
-        return self._run("monitor", lambda: self.services.monitor(cfg, self.stop_event))
+        cfg["live_url"] = url
+        if course:
+            cfg.setdefault("live_audio", {})["enabled"] = True
+        selected = course or self._selected()
+        cfg["notification_context"] = {"username": self._form["username"].strip(),
+                                       "course_name": selected.title if selected else ""}
+        cfg.pop("continuous_course", None)
+        if selected:
+            cfg["continuous_course"] = asdict(selected)
+        self._configure_monitor(cfg, selected, url)
+        previous = self._schedules
+        remaining = [c for c in previous if live_course_url(c) != url]
+        if remaining != previous:
+            if not self._persist_schedule(remaining):
+                return False
+            self._schedules = remaining
+        self._monitor_url, self._monitor_course = url, selected
+        self._publish(runningTitle=selected.title if selected else "课程直播", runningUrl=url)
+        started = self._run("monitor", lambda: self.services.monitor(cfg, self.stop_event))
+        if not started:
+            self._monitor_url, self._monitor_course = None, None
+            if remaining != previous and self._persist_schedule(previous):
+                self._schedules = previous
+        self._refresh_reservations()
+        return started
 
     @Slot()
     def stop(self):
         if self._task == "monitor" and not self.stop_event.is_set():
             self.stop_event.set()
-            self._publish(stopping=True, status="正在停止", statusKind="waiting")
+            self._publish(stopping=True)
+            self._task_publish(status="正在停止", statusKind="waiting")
             self._action()
 
     @Slot(str)
     def runAction(self, action):
-        if self._task or self._state["closing"] or action not in ("locate", "signin", "webhook"):
+        if self._task or self._state["closing"] or action != "webhook":
             return
         if action == "webhook" and not self._valid_url(self._form["webhook"]):
             self._feedback("请填写有效的企业微信 Webhook 地址", True, "webhook")
             return
-        if action != "locate" and not self.save():
+        if not self.save():
             return
-        self._location_request = (self._form["latitude"], self._form["longitude"])
         cfg = copy.deepcopy(self.cfg)
+        if action == "webhook":
+            selected = self._selected()
+            cfg["notification_context"] = {"username": self._form["username"].strip(),
+                                           "course_name": selected.title if selected else ""}
+            cfg["live_url"] = self._form["url"].strip()
         self._run(action, lambda: getattr(self.services, action)(cfg, self.stop_event))
 
     @staticmethod
@@ -594,6 +790,16 @@ class Controller(QObject):
             self._feedback("请填写有效的课程网址", True, "url")
 
     @Slot()
+    def openLogs(self):
+        directory = self.root / "logs"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._feedback("日志目录无法创建，请检查软件目录权限。", True)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory.resolve())))
+
+    @Slot()
     def copyCode(self):
         if self._state["code"]:
             QGuiApplication.clipboard().setText(self._state["code"])
@@ -602,6 +808,9 @@ class Controller(QObject):
 
     @Slot()
     def clearActivity(self):
+        url = self._state["selectedUrl"]
+        self._course_logs.pop(url, None)
+        self._course_activity.pop(url, None)
         self.log_model.reset()
         self.activity_model.reset()
 
@@ -611,12 +820,14 @@ class Controller(QObject):
         self.stop_event.clear()
         self._task = kind
         captions = dict(monitor="正在启动", courses="读取直播课", login="登录直播",
-                        signin="登录签到", locate="正在定位", webhook="测试通知")
-        self._publish(status=captions[kind], statusKind="waiting", stopping=False)
+                        webhook="测试通知")
+        self._publish(stopping=False)
+        publish = self._task_publish if kind == "monitor" else self._publish
+        publish(status=captions[kind], statusKind="waiting")
         if kind == "monitor":
             self._started = time.monotonic()
             self._has_transcript = False
-            self._publish(code="", elapsed="00:00:00", timerLabel="已运行时长", copied=False,
+            publish(code="", elapsed="00:00:00", timerLabel="已运行时长", copied=False,
                           transcript="正在准备语音识别…", transcriptHint="初始化本地模型，请稍候。",
                           transcriptFinal=False)
         self._action()
@@ -624,7 +835,8 @@ class Controller(QObject):
         def work():
             result, failed = None, False
             writer = QueueWriter(self.log_queue)
-            with redirect_stdout(writer), redirect_stderr(writer):
+            with (nullcontext() if getattr(self.services, "isolated", False) else redirect_stdout(writer)), \
+                 (nullcontext() if getattr(self.services, "isolated", False) else redirect_stderr(writer)):
                 try:
                     result = fn()
                     failed = type(result) is int and result != 0
@@ -649,15 +861,20 @@ class Controller(QObject):
             self._update_elapsed()
             self._started = None
         failure_status = dict(monitor="监控异常", courses="课程加载失败", login="登录未完成",
-                              signin="签到登录失败", locate="定位失败", webhook="通知失败")
-        self._publish(stopping=False, status=failure_status.get(kind, "任务异常") if failed else "已停止" if kind == "monitor" else "就绪",
+                              webhook="通知失败")
+        self._publish(stopping=False)
+        publish = self._task_publish if kind == "monitor" else self._publish
+        publish(status=failure_status.get(kind, "任务异常") if failed else "已停止" if kind == "monitor" else "就绪",
                       statusKind="error" if failed else "idle")
         self._action()
         if self._state["closing"]:
             self.closeReady.emit()
             return
         if kind == "monitor":
-            self._publish(transcriptHint="请查看活动记录后重试。" if failed else "监控已停止，可选择课程开始下一次监控。")
+            self._task_publish(transcriptHint="请查看活动记录后重试。" if failed else "监控已停止，可选择课程开始下一次监控。")
+            self._monitor_url, self._monitor_course = None, None
+            self._publish(runningTitle="", runningUrl="")
+            self._refresh_reservations()
         elif kind == "courses":
             if failed:
                 message = str(result) if isinstance(result, LiveError) else "读取课程失败，请检查网络后重试。"
@@ -669,31 +886,46 @@ class Controller(QObject):
             self._publish(needsLogin=not ok, courseLoadState="loading" if ok else "unloaded",
                           courseHint="登录成功，正在读取课程…" if ok else "登录未完成，请核对账号或完成浏览器验证。")
             if ok:
+                snapshot = self._login_snapshot
+                if snapshot and not snapshot[2]:
+                    credentials, remember, _ = snapshot
+                    try:
+                        if self.account_store is None:
+                            raise ValueError("请先修复已保存账号文件。")
+                        if remember:
+                            self.account_store.save(credentials["skl_username"], credentials["skl_password"])
+                        else:
+                            # Do not change existing remembered accounts, but do
+                            # not auto-fill a previous account on the next launch.
+                            from hdusign.accounts import write_json
+                            write_json(self.account_store.path,
+                                       {"accounts": self.account_store.accounts, "last": ""})
+                            self.account_store.last = ""
+                        disk = read_mapping(self.secrets_path)
+                        for key in ("skl_username", "skl_password", "skl_password_dpapi"):
+                            disk.pop(key, None)
+                        write_text_atomic(self.secrets_path, json.dumps(disk, ensure_ascii=False, indent=2))
+                        self.changed.emit()
+                    except (OSError, ValueError):
+                        self._feedback("登录成功，但账号保存失败，请检查文件权限或重新输入密码。", True)
+                self._login_snapshot = None
                 self.navigateCourses.emit()
                 self.refreshCourses()
             else:
                 self._feedback("登录未完成，请核对账号或完成浏览器验证。", True, "username")
-        elif kind == "locate":
-            if not failed and isinstance(result, Location):
-                if self._location_request == (self._form["latitude"], self._form["longitude"]):
-                    self._form.update(latitude=f"{result.lat:.6f}", longitude=f"{result.lng:.6f}")
-                    self.formChanged.emit()
-                    accuracy = f"，误差约 {result.accuracy_m:.0f} 米" if result.accuracy_m is not None else ""
-                    self._publish(dirty=self._form != self._saved_form, locationHint=f"已获取{accuracy}，请核对后保存。")
-                else:
-                    self._publish(locationHint="坐标已手动修改，保留当前填写。")
-            else:
-                self._publish(locationHint=str(result) if isinstance(result, Exception) else "定位失败，请手动填写。")
         if self._scheduled and not self._task:
             self._show_schedule()
 
     def _update_elapsed(self):
         if self._started is not None:
             seconds = int(time.monotonic() - self._started)
-            self._publish(elapsed=f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}")
+            self._task_publish(elapsed=f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}")
 
     def _update_countdown(self):
-        seconds = max(0, int(self._scheduled.start + START_DELAY - time.time()))
+        course = self._reserved()
+        if not course:
+            return
+        seconds = max(0, int(course.start + START_DELAY - time.time()))
         days, seconds = divmod(seconds, 86400)
         text = f"{seconds // 3600:02}:{seconds // 60 % 60:02}:{seconds % 60:02}"
         self._publish(elapsed=f"{days}天 {text}" if days else text)
@@ -701,21 +933,21 @@ class Controller(QObject):
     @Slot()
     def tick(self):
         self._update_elapsed()
-        self._action()
-        for row, course in enumerate(self._courses):
-            self.course_model.update(row, self._course_row(course))
+        self._refresh_reservations()
         if not self._scheduled or self._state["closing"]:
             return
         self._update_countdown()
         now = time.time()
-        if now >= self._scheduled.end:
-            if self.cancelSchedule():
+        remaining = [c for c in self._schedules if now < c.end + LATE_END]
+        if len(remaining) != len(self._schedules):
+            if self._persist_schedule(remaining):
+                self._schedules = remaining
+                self._show_course()
+                self._refresh_reservations()
                 self._feedback("预约课程已结束，未启动监控。")
-        elif now >= self._scheduled.start + START_DELAY and not self._task:
+        if self._scheduled and now >= self._scheduled.start + START_DELAY and not self._task:
             course = self._scheduled
-            self._scheduled = None
-            if not self.start_monitor():
-                self._scheduled = course
+            if not self.start_monitor(course):
                 self._show_schedule()
 
     @Slot()
@@ -767,17 +999,27 @@ class Controller(QObject):
                 updates.update(status="正在重连" if reconnecting else "正在连接", statusKind="waiting",
                                transcript="直播暂时中断，正在重新连接…" if reconnecting else "正在连接直播…",
                                transcriptFinal=False, transcriptHint="恢复收到声音后会继续识别。")
+            if line.startswith("[i] 直播课间休息") and self._task == "monitor" and not self.stop_event.is_set():
+                self._has_transcript = False
+                updates.update(status="课间休息", statusKind="waiting",
+                               transcript="等待下一节开始…", transcriptFinal=False,
+                               transcriptHint="到点后继续接收直播音频，可随时停止。")
             kind = ("error" if line.startswith("[错误]") or "Traceback" in line else
                     "warning" if line.startswith(("[!]", "[warn]")) else
                     "success" if line.startswith("[OK]") or "签到提醒" in line else "asr" if asr else "info")
             text = re.sub(r"^\[(?:ASR [^\]]+|i|OK)\]\s*", "", line)
             entry = dict(time=time.strftime("%H:%M:%S"), text=text, kind=kind)
             logs.append(entry)
-            if not asr and (code or any(word in line for word in ("签到提醒", "签到成功", "签到失败"))):
+            if not asr and (code or "签到提醒" in line):
                 activity.append(entry)
-        self.log_model.append(logs)
-        self.activity_model.append(activity)
-        self._publish(**updates)
+        url = self._monitor_url if self._monitor_url is not None else self._state["selectedUrl"]
+        for storage, entries, limit in ((self._course_logs, logs, self.log_model.limit),
+                                        (self._course_activity, activity, self.activity_model.limit)):
+            storage[url] = [*storage.get(url, ()), *entries][-limit:]
+        if url == self._state["selectedUrl"]:
+            self.log_model.append(logs)
+            self.activity_model.append(activity)
+        self._task_publish(**updates)
 
     @Slot(result=bool)
     def requestClose(self):

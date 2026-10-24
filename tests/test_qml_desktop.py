@@ -112,10 +112,10 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertEqual(self.c._form['username'], '12345')
 
     def test_invalid_field_is_scrolled_into_view(self):
-        self.c.setField('longitude', 'NaN')
-        self.c.save()
+        self.c.setField('webhook', 'invalid')
+        self.c.runAction('webhook')
         QTest.qWait(80)
-        field = self.item('field_longitude')
+        field = self.item('field_webhook')
         self.assertTrue(self.window.property('settingsVisible'))
         self.assertTrue(field.hasActiveFocus())
         top = field.mapToScene(QPointF()).y()
@@ -130,9 +130,11 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertEqual(self.item('pageBreadcrumb').property('text'), '设置')
         self.assertGreater(settings.width(), 700)
         self.assertTrue(self.item('field_username').isVisible())
-        for name in ('field_password', 'field_url', 'field_latitude', 'field_longitude',
+        for name in ('field_password', 'field_url',
                      'field_rules', 'field_webhook'):
             self.assertIsNotNone(self.item(name), name)
+        for name in ('field_latitude', 'field_longitude'):
+            self.assertIsNone(self.window.findChild(QObject, name))
         self.assertIsNotNone(self.item('navLive'))
         self.assertIsNotNone(self.item('monitorButton'))
 

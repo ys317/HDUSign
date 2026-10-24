@@ -428,6 +428,10 @@ class LiveLoginTests(unittest.TestCase):
         self.context = Mock()
         self.context.pages = [self.page]
         self.context.cookies.return_value = [cookie(), cookie("unrelated", "skl.hdu.edu.cn")]
+        self.profile_response = Mock()
+        self.profile_response.status = 200
+        self.profile_response.json.return_value = {"ok": True, "status": 200, "data": {"id": 1}}
+        self.context.request.get.return_value = self.profile_response
         self.playwright = Mock()
         self.playwright.chromium.launch_persistent_context.return_value = self.context
         self.live_browser = Mock()
@@ -474,9 +478,12 @@ class LiveLoginTests(unittest.TestCase):
         self.assertEqual(saved["jwt_token"], "fixture-jwt")
         self.assertNotIn("login_mode", saved)
         self.assertEqual(self.page.evaluate.call_args.args[1],
-                         {"origin": ORIGIN, "apiPath": live._API + "/v1/currentuser"})
+                         {"origin": ORIGIN})
         self.assertIn("location.origin !== origin", self.page.evaluate.call_args.args[0])
-        self.assertIn("body.data.id", self.page.evaluate.call_args.args[0])
+        self.assertNotIn("fetch(", self.page.evaluate.call_args.args[0])
+        self.context.request.get.assert_called_once_with(
+            ORIGIN + live._API + "/v1/currentuser", headers={"Accept": "application/json", "jwt-token": "fixture-jwt"},
+            timeout=4000, max_redirects=0, fail_on_status_code=False)
         self.assertFalse(list(self.root.glob(".live-session-*")))
         self.context.close.assert_called_once()
         self.playwright.chromium.launch.assert_not_called()

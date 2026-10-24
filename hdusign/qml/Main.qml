@@ -32,9 +32,10 @@ ApplicationWindow {
         : appController.state.courseLoadState === "empty" ? "可稍后刷新，也可在设置中填写课程网址。"
         : "读取今明课程；首次使用请先在设置中登录账号。"
     readonly property bool monitorEnabled: !appController.state.closing && !appController.state.stopping
-        && (!appController.state.busy || appController.state.monitoring)
+        && (!appController.state.busy || appController.state.monitoring
+            || (appController.state.accountMonitoring && appController.state.actionIcon === "clock"))
         && (appController.state.destructive || !appController.form.live || (!!appController.state.selectedUrl && !appController.state.needsLogin))
-    onClosing: function(event) { event.accepted = appController.requestClose() }
+    onClosing: function(event) { event.accepted = accountManager ? accountManager.requestClose() : appController.requestClose() }
     Shortcut { sequence: "Ctrl+S"; onActivated: appController.save() }
     Shortcut { sequence: "Ctrl+Shift+L"; onActivated: appController.toggleTheme() }
     Shortcut { sequence: "Ctrl+\\"; onActivated: window.collapsed = !window.collapsed }
@@ -42,6 +43,57 @@ ApplicationWindow {
         target: appController
         function onNavigateSettings(key) { window.settingsVisible = true; window.collapsed = false }
         function onNavigateCourses() { window.settingsVisible = false; window.collapsed = false; documentScroll.contentY = 0 }
+    }
+
+    Popup {
+        id: robotDialog
+        objectName: "robotConflictDialog"
+        property string selectedIdentity: ""
+        property string lastTicket: ""
+        readonly property var promptData: accountManager ? accountManager.robotPrompt : ({visible: false, ticket: "", description: "", choices: []})
+        visible: promptData.visible
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(window.width - 60, 600)
+        padding: 24; modal: true; focus: true
+        closePolicy: Popup.NoAutoClose
+        background: Rectangle { radius: 6; color: Theme.surface; border.color: Theme.border; border.width: 1 }
+        Connections {
+            target: accountManager
+            function onRobotPromptChanged() {
+                var next = accountManager.robotPrompt
+                if (robotDialog.lastTicket !== next.ticket || !next.choices.some(item => item.identity === robotDialog.selectedIdentity))
+                    robotDialog.selectedIdentity = ""
+                robotDialog.lastTicket = next.ticket
+            }
+        }
+        contentItem: Column {
+            spacing: 16
+            UiText { text: "请选择课程机器人"; font.pixelSize: 20; font.weight: Font.DemiBold }
+            UiText { width: parent.width; text: robotDialog.promptData.description; wrapMode: Text.Wrap; font.pixelSize: 14; color: Theme.muted }
+            ComboBox {
+                id: robotChoiceBox
+                objectName: "availableRobotBox"
+                width: parent.width
+                model: robotDialog.promptData.choices
+                textRole: "name"
+                currentIndex: model.findIndex(item => item.identity === robotDialog.selectedIdentity)
+                displayText: currentIndex < 0 ? "请选择空闲机器人" : currentText
+                enabled: count > 0
+                onActivated: robotDialog.selectedIdentity = model[currentIndex].identity
+            }
+            UiText {
+                width: parent.width
+                text: robotChoiceBox.count > 0 ? "已排除监听时间冲突的机器人（含课前、课后各两分钟）；时间不重叠可复用。" : "没有可用于本课程且测试成功的机器人。请先添加并测试新机器人，或取消本次操作。"
+                wrapMode: Text.Wrap; font.pixelSize: 13; color: Theme.amber
+            }
+            RowLayout {
+                width: parent.width; spacing: 8
+                UiButton { objectName: "robotSettingsButton"; text: "添加机器人"; onClicked: accountManager.openRobotSettings(robotDialog.promptData.ticket) }
+                Item { Layout.fillWidth: true }
+                UiButton { objectName: "cancelRobotChoiceButton"; text: robotDialog.promptData.cancelText || "暂不处理"; outline: true; onClicked: accountManager.cancelRobotChoice(robotDialog.promptData.ticket) }
+                UiButton { objectName: "confirmRobotChoiceButton"; text: "确认选择"; primary: true; enabled: robotChoiceBox.currentIndex >= 0; onClicked: accountManager.confirmRobotChoice(robotDialog.promptData.ticket, robotDialog.selectedIdentity) }
+            }
+        }
     }
 
     Rectangle {
@@ -110,6 +162,40 @@ ApplicationWindow {
                 tooltip: window.collapsed ? "设置" : ""
                 onClicked: { window.settingsVisible = true; window.collapsed = false }
             }
+            Column {
+                visible: accountManager !== null && !window.collapsed
+                width: parent.width; spacing: 4
+                Row {
+                    width: parent.width; spacing: 6
+                    UiText { text: "账号任务 · 上限 5 个"; color: Theme.subtle; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
+                    UiButton { text: "+"; width: 28; height: 26; tooltip: "添加账号"; onClicked: { accountManager.activate(""); window.settingsVisible = true } }
+                }
+                ListView {
+                    objectName: "accountTaskList"
+                    width: parent.width; height: Math.min(contentHeight, 230)
+                    clip: true
+                    model: accountManager ? accountManager.accountRows : []
+                    delegate: Item {
+                        required property var modelData
+                        width: ListView.view.width; height: 46
+                        Rectangle { anchors.fill: parent; radius: 4; color: modelData.active ? Theme.selected : "transparent" }
+                        Column {
+                            x: 8; y: 5; width: parent.width - 42; spacing: 3
+                            UiText { width: parent.width; text: modelData.name + " · " + modelData.status; elide: Text.ElideRight; font.pixelSize: 12 }
+                            UiText { width: parent.width; text: modelData.course || modelData.username; elide: Text.ElideRight; color: Theme.muted; font.pixelSize: 11 }
+                        }
+                        MouseArea { anchors.fill: parent; onClicked: accountManager.activate(modelData.username) }
+                        UiButton {
+                            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                            width: 30; height: 30; iconName: "stop"; tooltip: "停止此账号"
+                            visible: modelData.monitoring
+                            onClicked: accountManager.stopAccount(modelData.username)
+                        }
+                    }
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                }
+                UiButton { text: "停止全部监听"; outline: true; width: parent.width; height: 26; onClicked: accountManager.stopAll() }
+            }
         }
         Item {
             anchors.top: navigation.bottom; anchors.topMargin: 18
@@ -142,7 +228,7 @@ ApplicationWindow {
                         width: courseList.width
                         height: courseContent.implicitHeight + 12
                         leftPadding: 10; rightPadding: 8; topPadding: 6; bottomPadding: 6
-                        enabled: !appController.state.busy
+                        enabled: !appController.state.busy || appController.state.accountMonitoring
                         hoverEnabled: true
                         onClicked: { appController.selectCourse(entry.url); window.settingsVisible = false; documentScroll.contentY = 0 }
                         background: Rectangle {
@@ -168,8 +254,8 @@ ApplicationWindow {
                                 Rectangle { visible: courseDelegate.entry.active; width: 6; height: 6; radius: 3; color: Theme.green; anchors.verticalCenter: parent.verticalCenter }
                                 UiText {
                                     width: parent.width - (courseDelegate.entry.active ? 12 : 0)
-                                    text: [courseDelegate.entry.summary, courseDelegate.entry.detail].filter(function(part) { return part.length > 0 }).join(" · ")
-                                    font.pixelSize: 12; color: Theme.subtle; elide: Text.ElideRight
+                                    text: [courseDelegate.entry.monitoring ? "监听中" : courseDelegate.entry.reserved ? "已预约" : "", courseDelegate.entry.summary, courseDelegate.entry.detail].filter(function(part) { return part.length > 0 }).join(" · ")
+                                    font.pixelSize: 12; color: courseDelegate.entry.monitoring ? Theme.green : courseDelegate.entry.reserved ? Theme.amber : Theme.subtle; elide: Text.ElideRight
                                 }
                             }
                         }
@@ -322,6 +408,44 @@ ApplicationWindow {
                 Item { width: 1; height: 12 }
                 Rectangle { width: parent.width; height: 1; color: Theme.border }
                 Item { width: 1; height: 20 }
+                Column {
+                    objectName: "reservationPanel"
+                    width: parent.width; spacing: 8
+                    visible: appController.state.reservationCount > 0
+                    UiText { text: "本账号预约 · " + appController.state.reservationCount + " 门"; font.pixelSize: 15; font.weight: Font.DemiBold }
+                    Repeater {
+                        model: appController.reservations
+                        delegate: RowLayout {
+                            required property var modelData
+                            width: parent.width; spacing: 8
+                            Column {
+                                Layout.fillWidth: true; spacing: 3
+                                UiText { width: parent.width; text: modelData.title; elide: Text.ElideRight; font.pixelSize: 13 }
+                                UiText { text: modelData.fullTime; color: Theme.muted; font.pixelSize: 12 }
+                                UiText { width: parent.width; text: "机器人：" + (modelData.robotName || "未绑定"); elide: Text.ElideRight; color: modelData.robotPending ? Theme.amber : Theme.muted; font.pixelSize: 12 }
+                            }
+                            UiButton { text: "选择机器人"; height: 28; visible: accountManager !== null && (modelData.robotPending || modelData.robotName === "仅本地提醒"); onClicked: accountManager.chooseReservationRobot(appController.form.username, modelData.url) }
+                            UiButton { text: "查看"; height: 28; enabled: !appController.state.busy || appController.state.accountMonitoring; onClicked: appController.selectCourse(modelData.url) }
+                            UiButton { text: "取消"; height: 28; danger: true; enabled: !appController.state.closing; onClicked: appController.cancelReservation(modelData.url) }
+                        }
+                    }
+                    UiText { width: parent.width; text: "到点自动依次监听，请保持软件运行。查看其他课程不影响预约。"; wrapMode: Text.Wrap; color: Theme.subtle; font.pixelSize: 12 }
+                    Item { width: 1; height: 12 }
+                }
+                UiButton {
+                    objectName: "returnToMonitor"
+                    visible: appController.state.accountMonitoring && !appController.state.monitoring
+                    text: "正在监听：" + appController.state.runningTitle + " · 点击返回"
+                    iconName: "camera"; width: parent.width; alignLeft: true
+                    onClicked: appController.selectCourse(appController.state.runningUrl)
+                }
+                UiButton {
+                    objectName: "runningRobotButton"
+                    visible: accountManager !== null && appController.state.accountMonitoring
+                    text: "正在监听的课程机器人：" + appController.state.runningRobotName + (appController.state.runningRobotPending ? " · 点击选择" : "")
+                    width: parent.width; alignLeft: true; enabled: appController.state.runningRobotPending
+                    onClicked: accountManager.chooseReservationRobot(appController.form.username, appController.state.runningUrl)
+                }
                 Column {
                     objectName: "courseNotice"
                     visible: window.showCourseNotice

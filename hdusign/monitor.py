@@ -16,7 +16,6 @@ import time
 import yaml
 
 from hdusign.alert import Alerter
-from hdusign.attendance import make_auto_signer
 from hdusign.audio import SAMPLE_RATE, LoopbackSource, StreamingASR, WavFileSource
 from hdusign.rules import RuleMatcher, SignInWatcher, build_matchers, extract_codes
 
@@ -38,7 +37,12 @@ def cmd_devices() -> None:
 
 def make_engine(cfg: dict) -> StreamingASR:
     a = cfg.get("asr", {})
-    return StreamingASR(a.get("model_dir", "models/sherpa-onnx-streaming-zipformer-zh-14M"),
+    from pathlib import Path
+    from hdusign.runtime import application_root, data_root
+    model = a.get("model_dir", "models/sherpa-onnx-streaming-zipformer-zh-14M")
+    if data_root() != application_root() and not Path(model).is_absolute():
+        model = str(application_root() / model)
+    return StreamingASR(model,
                         int(a.get("num_threads", 1)), a.get("provider", "cpu"),
                         hotwords=a.get("hotwords") or [],
                         hotwords_score=float(a.get("hotwords_score", 1.5)),
@@ -48,19 +52,30 @@ def make_engine(cfg: dict) -> StreamingASR:
 def make_alerter(cfg: dict, dedup_override: float | None = None, clock=None) -> Alerter:
     al = cfg.get("alert", {})
     wh = al.get("webhook", {}) or {}
+    context = cfg.get("notification_context") or {}
+    student_name = ""
+    if context and (wh.get("url") or cfg.get("_notification_route")):
+        from hdusign.live import notification_name
+        student_name = notification_name(cfg)
+    resolver = None
+    if cfg.get("_notification_route"):
+        from hdusign.reservation_webhooks import route_resolver
+        from hdusign.runtime import data_root
+        resolver = route_resolver(data_root(), cfg["_notification_route"])
     return Alerter(al.get("log_file", "alerts.jsonl"),
                    float(al.get("dedup_seconds", 90)) if dedup_override is None else dedup_override,
-                   str(wh.get("url", "") or ""), wh.get("levels", ("high", "code")), clock=clock)
+                   str(wh.get("url", "") or ""), wh.get("levels", ("high", "code")), clock=clock,
+                   student_name=student_name,
+                   course_name=context.get("course_name") or ("未选择课程" if context else ""),
+                   webhook_resolver=resolver)
 
 
-def make_watcher(cfg: dict, alerter: Alerter, auto=None, stop=None, clock=None) -> SignInWatcher:
+def make_watcher(cfg: dict, alerter: Alerter, stop=None, clock=None) -> SignInWatcher:
     cw = cfg.get("code_watch", {})
 
     def on_code(code: str, text: str):
         if stop is not None and stop.is_set():
             return
-        if auto:
-            auto.submit(code)
         alerter.notify(text, "code", f"签到码: {code}")
 
     w = SignInWatcher(float(cw.get("window_seconds", 60)),
@@ -71,8 +86,6 @@ def make_watcher(cfg: dict, alerter: Alerter, auto=None, stop=None, clock=None) 
                       early_code=bool(cw.get("early_code", True)),
                       early_stable_seconds=float(cw.get("early_stable_seconds", 0.4)))
     w.on_code = on_code
-    if auto is not None:
-        w.on_prepare = lambda: auto.prepare() if stop is None or not stop.is_set() else None
     return w
 
 
@@ -101,7 +114,8 @@ class AudioClock:
 
 
 def run_pipeline(chunks, asr, matchers, alerter, watcher: SignInWatcher | None = None,
-                 show_partial: bool = True, stop=None, clock: AudioClock | None = None) -> None:
+                 show_partial: bool = True, stop=None, clock: AudioClock | None = None,
+                 diagnostics=None) -> None:
     t0 = time.time()
     audio_time = 0.0
     partial_matchers = [m for m in matchers if isinstance(m, RuleMatcher)]
@@ -110,6 +124,8 @@ def run_pipeline(chunks, asr, matchers, alerter, watcher: SignInWatcher | None =
         if stop is not None and stop.is_set():
             return
         stamp = clock.stamp() if clock is not None else time.strftime("%H:%M:%S")
+        if diagnostics is not None:
+            diagnostics.final(text)
         print(f"\r[ASR {stamp}] {text}          ")
         hits = [h for m in matchers if (h := m.match(text))]
         if stop is not None and stop.is_set():
@@ -130,7 +146,10 @@ def run_pipeline(chunks, asr, matchers, alerter, watcher: SignInWatcher | None =
             print("\n[i] 收到停止信号")
             break
         audio_time += len(chunk) / SAMPLE_RATE
+        processing_started = time.monotonic()
         finals, partial = asr.accept(chunk)
+        if diagnostics is not None:
+            diagnostics.asr_result(chunk, time.monotonic() - processing_started, partial, finals)
         if stop is not None and stop.is_set():
             break
         for text in finals:
@@ -162,12 +181,9 @@ def cmd_run(cfg: dict, stop=None) -> None:
     src = LoopbackSource(cfg.get("device") or None, chunk)
     print(f"[i] 正在监听输出设备: {src.speaker_name} (内录环回)")
     alerter = make_alerter(cfg)
-    auto = make_auto_signer(cfg, alerter, stop)
     try:
-        if auto is not None:
-            auto.prepare()
         matchers = build_matchers(cfg)
-        watcher = make_watcher(cfg, alerter, auto, stop)
+        watcher = make_watcher(cfg, alerter, stop)
         print(f"[i] 匹配器: {[type(m).__name__ for m in matchers]}")
         asr = make_engine(cfg)
         if stop.is_set():
@@ -178,21 +194,25 @@ def cmd_run(cfg: dict, stop=None) -> None:
     except KeyboardInterrupt:
         stop.set()
         print("\n已停止")
-    finally:
-        if auto is not None:
-            auto.close()
 
 
 def cmd_run_live(cfg: dict, stop=None) -> None:
     """Read a single live stream without a playing browser or loopback capture."""
-    from hdusign.live import LiveClient, LiveEnded, LiveError
+    from hdusign.live import LiveClient, LiveEnded, LiveError, LiveNotStarted, parse_live_page
+    from hdusign.lessons import DeadlineStop, LessonPlan, EARLY_START
     from hdusign.media import FFmpegAudioSource, MediaError, find_ffmpeg
 
     stop = stop if stop is not None else threading.Event()
     if stop.is_set():
         return
+    try:
+        plan = LessonPlan.from_mapping(cfg.get("continuous_course"),
+                                       parse_live_page(str(cfg.get("live_url") or ""))[1])
+    except ValueError as exc:
+        raise LiveError(str(exc)) from None
     executable = find_ffmpeg()
-    auto = None
+    from hdusign.diagnostics import Diagnostics
+    diagnostics = Diagnostics(cfg, plan)
     asr = watcher = None
     failures = auth_failures = 0
     outage_started = None
@@ -210,31 +230,70 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
     try:
         with LiveClient(str(cfg.get("live_url") or ""), cfg) as client:
             alerter = make_alerter(cfg)
-            auto = make_auto_signer(cfg, alerter, stop)
-            if auto is not None:
-                auto.prepare()
             print("[i] 直播状态: 正在连接")
+            current_lesson = None
             while not stop.is_set():
+                stream_stop = stop
+                if plan is not None:
+                    window = plan.window(time.time())
+                    if window is None:
+                        print("[i] 整堂直播已结束，监控已停止。")
+                        break
+                    lesson_id, deadline = window
+                    if current_lesson != lesson_id:
+                        if current_lesson is not None:
+                            print(f"[i] 正在切换第三节直播，课程编号 {lesson_id}。")
+                            print("[i] 直播状态: 正在连接")
+                            if watcher is not None:
+                                watcher.discard_partial()
+                            if asr is not None:
+                                asr.restart()
+                        else:
+                            print(f"[i] 已启用课表监控（{len(plan.ids)} 节）；提前两分钟连接，结束后延长两分钟。")
+                        client.select_lesson(lesson_id, deadline)
+                        current_lesson = lesson_id
+                        failures = auth_failures = 0
+                        outage_started = None
+                    stream_stop = DeadlineStop(stop, deadline)
+                    pause_until = plan.break_until(time.time())
+                    if outage_started is not None and pause_until is not None:
+                        print("[i] 直播课间休息，等待下一节课前两分钟重试连接。")
+                        if stop.wait(max(0.0, pause_until - time.time())):
+                            break
+                        failures = auth_failures = 0
+                        outage_started = None
+                        continue
                 if recovery_expired():
                     raise recovery_failed() from None
                 try:
                     # Refresh only this lesson's playback credentials. API
                     # outages follow the same bounded recovery as media outages.
+                    resolving_at = time.monotonic()
+                    diagnostics.mark("stream_resolve_started", course_id=str(client.course_id))
                     stream = client.resolve()
+                    diagnostics.mark("stream_resolved", course_id=str(client.course_id),
+                                     request_seconds=round(time.monotonic() - resolving_at, 3))
                     if stop.is_set():
                         return
+                    if stream_stop.is_set():
+                        continue
                     if recovery_expired():
                         raise recovery_failed() from None
                     if asr is None:
                         print("[i] 正在准备直播音频识别，无需网页播放")
+                        diagnostics.mark("model_loading")
                         matchers = build_matchers(cfg)
                         asr = make_engine(cfg)
+                        diagnostics.mark("model_ready")
                         if stop.is_set():
                             return
-                        watcher = make_watcher(cfg, alerter, auto, stop)
+                        watcher = make_watcher(cfg, alerter, stop)
+                        if stream_stop.is_set():
+                            continue
                     source = FFmpegAudioSource(
                         stream.url, headers=stream.headers,
                         chunk_seconds=float(cfg.get("chunk_seconds", 0.25)), executable=executable)
+                    diagnostics.begin_stream(client.course_id)
 
                     def live_chunks():
                         nonlocal failures, auth_failures, outage_started
@@ -243,9 +302,9 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
                         received_seconds = 0.0
                         stable = False
                         gaps = 0
-                        with closing(source.chunks(stop)) as chunks:
+                        with closing(source.chunks(stream_stop)) as chunks:
                             for chunk in chunks:
-                                if stop.is_set():
+                                if stream_stop.is_set():
                                     return
                                 if recovery_expired():
                                     raise recovery_failed() from None
@@ -262,6 +321,7 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
                                     auth_failures = 0
                                     print("[i] ASR 就绪 · 正在接收直播音频")
                                     first = False
+                                diagnostics.audio(chunk, source)
                                 received_seconds += len(chunk) / SAMPLE_RATE
                                 # One or two successful chunks must not renew
                                 # the budget of a continuously flapping stream.
@@ -271,27 +331,64 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
                                     outage_started = None
                                     stable = True
                                 yield chunk
-                        if not stop.is_set():
+                        if not stream_stop.is_set():
                             # A dropped connection must not turn an incomplete
                             # digit prefix into a finalized attendance code.
                             raise MediaError("直播音频连接已结束")
 
                     with closing(live_chunks()) as chunks:
-                        run_pipeline(chunks, asr, matchers, alerter, watcher, stop=stop)
+                        run_pipeline(chunks, asr, matchers, alerter, watcher, stop=stream_stop,
+                                     diagnostics=diagnostics)
+                    if plan is not None and not stop.is_set():
+                        continue
                     break
                 except LiveEnded:
+                    if plan is not None and not stop.is_set():
+                        # The API may still report the previous cell at a
+                        # boundary. Re-evaluate the plan rather than choosing
+                        # another course or finalizing partial speech.
+                        if plan.window(time.time()) != (current_lesson, deadline):
+                            continue
+                        raise
                     if not stop.is_set():
                         print("[i] 本节直播已结束，监控已停止。")
                     break
                 except (MediaError, LiveError) as exc:
+                    diagnostics.mark("stream_error", error_type=type(exc).__name__,
+                                     course_id=str(client.course_id))
                     if stop.is_set():
                         break
-                    if not exc.retryable:
+                    if (plan is not None and plan.window(time.time()) != (current_lesson, deadline)
+                            and (exc.retryable or isinstance(exc, LiveNotStarted))):
+                        continue
+                    scheduled_start = plan.upcoming_start(time.time()) if plan is not None else None
+                    starting = (isinstance(exc, LiveNotStarted) and scheduled_start is not None
+                                and scheduled_start - EARLY_START <= time.time() < scheduled_start + recovery_seconds)
+                    break_until = plan.break_until(time.time()) if plan is not None else None
+                    waiting_for_class = isinstance(exc, LiveNotStarted) and break_until is not None
+                    if not exc.retryable and not starting and not waiting_for_class:
                         raise
+                    if starting:
+                        # Waiting for a scheduled stream is not an audio outage.
+                        # Keep polling through pre-roll and the startup grace period.
+                        outage_started = None
+                        delay = min(6.0, scheduled_start + recovery_seconds - time.time(),
+                                    max(0.0, deadline - time.time()))
+                        print(f"[i] 直播尚未开始，{delay:g} 秒后重试连接。")
+                        if stop.wait(max(0.0, delay)):
+                            break
+                        continue
                     if watcher is not None:
                         watcher.discard_partial()
                     if asr is not None:
                         asr.restart()
+                    if break_until is not None:
+                        print("[i] 直播课间休息，等待下一节课前两分钟重试连接。")
+                        if stop.wait(max(0.0, break_until - time.time())):
+                            break
+                        failures = auth_failures = 0
+                        outage_started = None
+                        continue
                     if getattr(exc, "kind", "") == "auth":
                         auth_failures += 1
                     if auth_failures >= 2:
@@ -299,12 +396,17 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
                     last_error = str(exc)
                     now = time.monotonic()
                     if outage_started is None:
-                        outage_started = now
+                        # Pre-class connection attempts must not consume the
+                        # entire recovery budget before the class even begins.
+                        outage_started = now + (max(0.0, scheduled_start - time.time())
+                                                if scheduled_start is not None else 0.0)
                     failures += 1
                     if recovery_expired():
                         raise recovery_failed() from None
                     delay = min(retry_delays[min(failures - 1, len(retry_delays) - 1)],
                                 recovery_seconds - (now - outage_started))
+                    if plan is not None:
+                        delay = min(delay, max(0.0, deadline - time.time()))
                     print("[i] 直播状态: 正在重连")
                     print(f"[!] {last_error} {delay:g} 秒后重试（连续第 {failures} 次）。")
                     if stop.wait(delay):
@@ -313,8 +415,7 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
         stop.set()
         print("\n已停止")
     finally:
-        if auto is not None:
-            auto.close()
+        diagnostics.close()
 
 
 def cmd_test(cfg: dict, wav: str, realtime: bool) -> None:
@@ -322,19 +423,12 @@ def cmd_test(cfg: dict, wav: str, realtime: bool) -> None:
     clock = AudioClock()
     src = WavFileSource(wav, float(cfg.get("chunk_seconds", 0.25)), realtime)
     alerter = make_alerter(cfg, dedup_override=0, clock=clock)
-    auto = make_auto_signer(cfg, alerter, stop)
-    completed = False
-    try:
-        matchers = build_matchers(cfg)
-        watcher = make_watcher(cfg, alerter, auto, stop, clock=clock)
-        asr = make_engine(cfg)
-        with closing(src.chunks()) as chunks:
-            run_pipeline(clock.advance(chunks), asr, matchers, alerter, watcher,
-                         stop=stop, clock=clock)
-        completed = True
-    finally:
-        if auto is not None:
-            auto.close(cancel=not completed)
+    matchers = build_matchers(cfg)
+    watcher = make_watcher(cfg, alerter, stop, clock=clock)
+    asr = make_engine(cfg)
+    with closing(src.chunks()) as chunks:
+        run_pipeline(clock.advance(chunks), asr, matchers, alerter, watcher,
+                     stop=stop, clock=clock)
 
 
 def cmd_demo(cfg: dict) -> None:
@@ -357,14 +451,15 @@ def cmd_demo(cfg: dict) -> None:
             print("    -> 未命中")
 
 
-def cmd_webhook_test(cfg: dict) -> None:
+def cmd_webhook_test(cfg: dict) -> int:
     alerter = make_alerter(cfg, dedup_override=0)
     if not alerter.webhook_url:
         print("config.yaml 里 alert.webhook.url 为空, 请先填入机器人 Webhook 地址")
-        return
+        return 1
     print("正在发送 HDUSign 测试推送…")
-    alerter._send_wechat(time.strftime("%H:%M:%S"), "test", "HDUSign 测试推送",
-                         "这是一条 HDUSign 测试消息，收到说明企业微信推送正常。")
+    success = alerter._send_wechat(time.strftime("%H:%M:%S"), "test", "HDUSign 测试推送",
+                                 "这是一条 HDUSign 测试消息，收到说明企业微信推送正常。")
+    return 0 if success else 1
 
 
 def cmd_code() -> None:
