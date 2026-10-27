@@ -160,7 +160,11 @@ def create_engine(controller, app=None):
     qml = resource_root() / "hdusign" / "qml" / "Main.qml"
     if getattr(sys, "frozen", False):
         from hdusign import __version__
-        qml = resource_root() / ("qml-" + __version__) / "Main.qml"
+        # Incremental packages keep versioned QML alongside the original
+        # runtime; full PyInstaller packages bundle it under hdusign/qml.
+        versioned_qml = resource_root() / ("qml-" + __version__) / "Main.qml"
+        if versioned_qml.is_file():
+            qml = versioned_qml
     engine.load(QUrl.fromLocalFile(str(qml)))
     if not engine.rootObjects():
         raise RuntimeError("无法加载 HDUSign Qt Quick 界面：\n" + "\n".join(load_errors))
@@ -257,9 +261,10 @@ def check_desktop_runtime():
                           diagnostics_default_on=True, per_course_webhooks=True,
                           webhook_conflict_dialog=True, occupied_webhooks_excluded=True,
                           nonoverlapping_webhooks_reused=True,
-                          automatic_sign_settings_removed="autoSign" not in current._form)
-            if not report["automatic_sign_settings_removed"]:
-                raise RuntimeError("界面仍包含自动签到设置")
+                          automatic_sign_settings_available=all(
+                              name in current._form for name in ("autoSign", "latitude", "longitude")))
+            if not report["automatic_sign_settings_available"]:
+                raise RuntimeError("界面缺少自动签到设置")
     finally:
         if controller:
             controller.shutdown()

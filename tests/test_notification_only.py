@@ -17,8 +17,8 @@ from hdusign.__main__ import main
 
 
 class NotificationOnlyTests(unittest.TestCase):
-    def test_replay_with_legacy_auto_sign_enabled_only_sends_code_notification(self):
-        cfg = {'auto_sign': {'enabled': True, 'prewarm_browser': True},
+    def test_replay_with_auto_sign_disabled_only_sends_code_notification(self):
+        cfg = {'auto_sign': {'enabled': False, 'prewarm_browser': True},
                'code_watch': {'log_file': os.devnull}, 'rules': {'strong': ['签到']}}
         asr = Mock()
         asr.accept.return_value = (['签到码零一二三'], '')
@@ -55,32 +55,49 @@ class NotificationOnlyTests(unittest.TestCase):
             for expected in ('签到码: 0123', '测试同学', '测试课'):
                 self.assertIn(expected, body)
 
-    def test_removed_cli_commands_are_rejected_without_opening_browser(self):
-        for args in (['--sign', '0123'], ['--sign-worker', '--exchange-dir', 'unused'], ['--login']):
+    def test_signing_cli_dispatch_preserves_arguments_without_starting_real_browser(self):
+        for args, target, forwarded in (
+                (['--sign', '0123', '--captcha-boost=off'], 'sign', ['0123', '--captcha-boost=off']),
+                (['--sign-worker', '--exchange-dir', 'unused'], 'sign_worker', ['--exchange-dir', 'unused']),
+                (['--login'], 'login', None)):
             with self.subTest(args=args), patch('os.chdir'), redirect_stdout(StringIO()), \
-                    patch('sys.stderr', new_callable=StringIO), \
-                    patch('playwright.sync_api.sync_playwright', side_effect=AssertionError('Unexpected browser')):
-                with self.assertRaises(SystemExit) as error:
-                    main(args)
-                self.assertEqual(error.exception.code, 2)
+                    patch.object(browser, target, return_value=0) as dispatch:
+                self.assertEqual(main(args), 0)
+                if forwarded is None:
+                    dispatch.assert_called_once_with()
+                else:
+                    dispatch.assert_called_once_with(forwarded)
 
-    def test_signing_functions_are_removed(self):
-        for name in ('sign', 'sign_worker', 'sign_with_code', 'open_sign_in', 'login'):
-            self.assertFalse(hasattr(browser, name))
+    def test_demo_explicitly_disables_signing_even_when_template_enables_it(self):
+        from hdusign.demo import prepare_demo
+        import yaml
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prepare_demo(root)
+            cfg = yaml.safe_load((root / 'config.yaml').read_text('utf-8'))
+            self.assertIs(cfg['auto_sign']['enabled'], False)
 
-    def test_saving_settings_cleans_obsolete_signing_keys(self):
+    def test_saving_settings_preserves_signing_location_and_local_captcha_options(self):
         from hdusign.demo import DemoController, prepare_demo
+        import yaml
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             prepare_demo(root)
             controller = DemoController(root)
-            controller.shutdown()
             try:
-                controller.cfg.update(auto_sign={'enabled': True}, location={'lat': 'invalid'})
+                controller.cfg['auto_sign'].update(prewarm_browser=False, captcha_trajectory=False,
+                                                    timeout_seconds=240, local_option='keep')
+                controller._form.update(autoSign=True, latitude='30.5', longitude='120.5')
                 self.assertTrue(controller.save())
-                for name in ('auto_sign', 'location'):
-                    self.assertNotIn(name, controller.cfg)
-                for name in ('autoSign', 'latitude', 'longitude'):
-                    self.assertNotIn(name, controller._form)
+                cfg = yaml.safe_load((root / 'config.yaml').read_text('utf-8'))
+                self.assertEqual(cfg['auto_sign'], controller.cfg['auto_sign'])
+                self.assertTrue(cfg['auto_sign']['enabled'])
+                self.assertFalse(cfg['auto_sign']['prewarm_browser'])
+                self.assertFalse(cfg['auto_sign']['captcha_trajectory'])
+                self.assertEqual(cfg['auto_sign']['timeout_seconds'], 240)
+                self.assertEqual(cfg['auto_sign']['local_option'], 'keep')
+                self.assertEqual(cfg['location'], {'lat': 30.5, 'lng': 120.5})
+                for key in ('autoSign', 'latitude', 'longitude'):
+                    self.assertIn(key, controller._form)
             finally:
                 controller.shutdown()

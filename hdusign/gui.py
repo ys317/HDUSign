@@ -1,6 +1,7 @@
 """HDUSign desktop console.
 
   python -m hdusign               # 图形界面
+  HDUSign.exe --sign 2330         # 打包后自动签到入口（内部使用）
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import customtkinter as ctk
 import yaml
 
 from hdusign import __version__, ui as design
+from hdusign.location import DEFAULT_LAT, DEFAULT_LNG, Location, LocationError, get_current_location
 from hdusign.live import LiveCourse
 from hdusign.ui import Entry, NotionMenu, QuoteText, ScrollableFrame, Switch, Textbox
 from hdusign.runtime import application_root, resource_root
@@ -135,6 +137,9 @@ class App(ctk.CTk):
         self.v_user = ctk.StringVar()
         self.v_pwd = ctk.StringVar()
         self.v_hook = ctk.StringVar()
+        self.v_lat = ctk.StringVar()
+        self.v_lng = ctk.StringVar()
+        self.v_auto = ctk.BooleanVar(value=True)
         self.v_sem = ctk.BooleanVar(value=False)
         self.v_live = ctk.BooleanVar(value=True)
         self.v_follow = ctk.BooleanVar(value=True)
@@ -145,7 +150,7 @@ class App(ctk.CTk):
         self._loading = False
         self._saved_values = self._field_values()
         for var in (self.v_url, self.v_user, self.v_pwd, self.v_hook,
-                    self.v_sem, self.v_live):
+                    self.v_lat, self.v_lng, self.v_auto, self.v_sem, self.v_live):
             var.trace_add("write", self._mark_dirty)
         self.v_live.trace_add("write", self._update_audio_mode)
         self.v_url.trace_add("write", self._url_edited)
@@ -369,6 +374,8 @@ class App(ctk.CTk):
         self._account_page(self._pages["extras"])
         self._divider(self._pages["extras"], 16)
         self._advanced_page(self._pages["extras"])
+        self._divider(self._pages["extras"], 16)
+        self._signin_page(self._pages["extras"])
         self._divider(self._pages["extras"], 16)
         self._rules_page(self._pages["extras"])
         self._divider(self._pages["extras"], 16)
@@ -628,6 +635,15 @@ class App(ctk.CTk):
         self._url_hint.pack(fill="x", pady=(0, 4))
         self.b_live_account.pack(fill="x", pady=(4, 0))
 
+    def _signin_page(self, page):
+        self._switch_row(
+            page, "自动签到", "使用首页账号，确认签到码后提交", self.v_auto)
+        self.b_login = self._button(
+            page, "重新登录签到", self.do_login, height=36,
+            border_color=design.INPUT_BORDER, border_width=1)
+        self.b_login.pack(fill="x")
+        self._divider(page, (12, 8))
+        self._location_fields(page)
 
     def _toggle_manual_url(self):
         self._show_manual_url(not bool(self._manual_url.winfo_manager()))
@@ -665,6 +681,26 @@ class App(ctk.CTk):
         self.b_test = self._field_actions["hook"]
         self._label(page, "选填，留空时仅在本机提醒", 11, design.TXT3).pack(anchor="w")
 
+    def _location_fields(self, page):
+        caption = ctk.CTkFrame(page, fg_color="transparent")
+        caption.pack(fill="x", pady=(0, 8))
+        self._label(caption, "签到位置", 13, design.TXT2).pack(side="left")
+        self.b_locate = self._button(
+            caption, "获取当前位置", self.locate, width=96, height=26,
+            font=(design.F, 11))
+        self.b_locate.pack(side="right")
+        row = ctk.CTkFrame(page, fg_color="transparent")
+        row.pack(fill="x")
+        row.grid_columnconfigure((0, 1), weight=1, uniform="location")
+        for i, (key, title, var) in enumerate((
+                ("lat", "纬度", self.v_lat), ("lng", "经度", self.v_lng))):
+            col = ctk.CTkFrame(row, fg_color="transparent")
+            col.grid(row=0, column=i, sticky="ew", padx=(0, 10) if i == 0 else 0)
+            self._field(col, key, title, var, bottom=8)
+        self._location_hint = self._label(
+            page, "可通过 Windows 定位填入，请核对后保存。",
+            11, design.TXT3, wraplength=244, justify="left")
+        self._location_hint.pack(fill="x")
 
     def _switch_row(self, parent, title, desc, variable):
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -949,6 +985,10 @@ class App(ctk.CTk):
         self.v_pwd.set(self.secrets.get("skl_password", ""))
         hook = ((self.cfg.get("alert") or {}).get("webhook") or {}).get("url", "")
         self.v_hook.set(str(hook or ""))
+        location = self.cfg.get("location") or {}
+        self.v_lat.set(str(location.get("lat", DEFAULT_LAT)))
+        self.v_lng.set(str(location.get("lng", DEFAULT_LNG)))
+        self.v_auto.set(bool((self.cfg.get("auto_sign") or {}).get("enabled", True)))
         rules = self.cfg.get("rules") or {}
         self.v_sem.set(bool((rules.get("semantic") or {}).get("enabled", False)))
         self.txt_rules.insert("1.0", "\n".join(str(r) for r in rules.get("strong", [])))
@@ -959,7 +999,8 @@ class App(ctk.CTk):
     def _field_values(self):
         return (
             self.v_url.get(), self.v_user.get(), self.v_pwd.get(),
-            self.v_hook.get(), self.v_sem.get(),
+            self.v_hook.get(), self.v_lat.get(), self.v_lng.get(),
+            self.v_auto.get(), self.v_sem.get(),
             self.txt_rules.get("1.0", "end-1c"),
             self.v_live.get(),
         )
@@ -1401,6 +1442,20 @@ class App(ctk.CTk):
         return False
 
     def save_cfg(self) -> bool:
+        coords = {}
+        for key, var, title, limit in (
+                ("lat", self.v_lat, "纬度", 90),
+                ("lng", self.v_lng, "经度", 180)):
+            try:
+                value = float(var.get().strip())
+                if not math.isfinite(value) or not -limit <= value <= limit:
+                    raise ValueError
+            except ValueError:
+                return self._field_error(key, f"{title}须为 {-limit} 到 {limit} 的数字")
+            coords[key] = value
+            self._entries[key].invalid = False
+            self._entries[key].configure(border_color=design.INPUT_BORDER)
+
         cfg = copy.deepcopy(self.cfg)
         secrets = copy.deepcopy(self.secrets)
         cfg["ui"] = {**(cfg.get("ui") or {}), "appearance": self._appearance}
@@ -1411,8 +1466,8 @@ class App(ctk.CTk):
         else:
             cfg["scheduled_course"] = self._scheduled_course_data(self._scheduled_course)
         cfg.setdefault("alert", {}).setdefault("webhook", {})["url"] = self.v_hook.get().strip()
-        cfg.pop("location", None)
-        cfg.pop("auto_sign", None)
+        cfg["location"] = {**(cfg.get("location") or {}), **coords}
+        cfg.setdefault("auto_sign", {})["enabled"] = bool(self.v_auto.get())
         cfg.setdefault("rules", {}).setdefault("semantic", {})["enabled"] = bool(self.v_sem.get())
         cfg["rules"]["strong"] = [
             line.strip() for line in self.txt_rules.get("1.0", "end").splitlines()
@@ -1484,7 +1539,9 @@ class App(ctk.CTk):
         self.b_monitor.configure(state="disabled")
         for key in ("user", "pwd"):
             self._entries[key].configure(state="disabled")
+        self.b_login.configure(state="disabled")
         self.b_test.configure(state="disabled")
+        self.b_locate.configure(state="disabled")
         self.b_course_refresh.configure(state="disabled")
         self._update_audio_mode()
         if kind == "monitor":
@@ -1498,8 +1555,15 @@ class App(ctk.CTk):
             self._update_monitor_button()
             self.b_monitor.configure(state="normal")
             self._set_status(design.AMBER, "正在启动")
+        elif kind == "login":
+            self.b_login.configure(text="登录中…")
+            self._set_status(design.AMBER, "登录中")
         elif kind == "live_login":
             self._set_status(design.AMBER, "登录直播")
+        elif kind == "location":
+            self.b_locate.configure(text="获取中…")
+            self._location_hint.configure(text="正在获取 Windows 位置…", text_color=design.TXT3)
+            self._set_status(design.AMBER, "正在定位")
         elif kind == "live_courses":
             self.b_course_refresh.configure(text="读取中…")
             self._set_status(design.AMBER, "读取直播课")
@@ -1516,7 +1580,7 @@ class App(ctk.CTk):
                 try:
                     result = fn(*args)
                     failed = type(result) is int and result != 0
-                except LiveError as exc:
+                except (LocationError, LiveError) as exc:
                     failed = True
                     result = exc
                     print(f"[!] {exc}")
@@ -1572,6 +1636,25 @@ class App(ctk.CTk):
                     "监控已中断" if self._monitor_ready else "监控未能启动") if failed else "监控已结束")
             self._transcript_hint.configure(
                 text="请查看下方活动记录，调整后重试。" if failed else "选择课程后点击「开始监控」开始下一次课堂。")
+        elif kind == "location":
+            if failed:
+                message = str(result) if isinstance(result, LocationError) else "获取失败，请查看活动记录或手动填写。"
+                self._location_hint.configure(text=message, text_color=design.AMBER)
+            elif isinstance(result, Location):
+                if (self.v_lat.get(), self.v_lng.get()) != self._location_request_values:
+                    self._location_hint.configure(
+                        text="坐标已手动修改，已保留当前填写。", text_color=design.TXT3)
+                else:
+                    self.v_lat.set(f"{result.lat:.6f}")
+                    self.v_lng.set(f"{result.lng:.6f}")
+                    for key in ("lat", "lng"):
+                        self._entries[key].invalid = False
+                        self._entries[key].configure(border_color=design.INPUT_BORDER)
+                    accuracy = f"，误差约 {result.accuracy_m:.0f} 米" if result.accuracy_m is not None else ""
+                    self._location_hint.configure(
+                        text=f"已获取{accuracy}。请核对后保存。",
+                        text_color=design.AMBER if result.accuracy_m is not None and result.accuracy_m > 1000 else design.TXT3)
+                    self.logline(f"[OK] 已获取 Windows 当前位置{accuracy}，请核对后保存。")
         elif kind == "live_courses":
             if failed:
                 from hdusign.live import LiveError
@@ -1590,9 +1673,11 @@ class App(ctk.CTk):
         self._t0 = None
         self.worker = None
         self._update_monitor_button()
+        self.b_login.configure(state="normal", text="重新登录签到")
         for key in ("user", "pwd"):
             self._entries[key].configure(state="normal")
         self.b_test.configure(state="normal", text="测试推送")
+        self.b_locate.configure(state="normal", text="获取当前位置")
         self.b_course_refresh.configure(state="normal", text="刷新")
         self._update_audio_mode()
         if failed:
@@ -1664,6 +1749,16 @@ class App(ctk.CTk):
         self._set_status(design.AMBER, "正在停止")
         self.logline("[i] 正在停止监控…")
 
+    def do_login(self):
+        if self._busy() or not self.save_cfg():
+            return
+
+        def run():
+            from hdusign import browser
+
+            return browser.login()
+
+        self._worker(run, kind="login")
 
     def do_live_login(self, switch_account=False):
         if self._busy():
@@ -1723,6 +1818,11 @@ class App(ctk.CTk):
 
         self._worker(run, copy.deepcopy(self.cfg), kind="webhook")
 
+    def locate(self):
+        if self._busy():
+            return
+        self._location_request_values = (self.v_lat.get(), self.v_lng.get())
+        self._worker(get_current_location, kind="location")
 
     @staticmethod
     def _valid_url(value):
@@ -1831,7 +1931,8 @@ class App(ctk.CTk):
                 preview = (line.partition("]")[2].strip(), design.TXT, "")
             if (code := re.search(r"签到码[:：]\s*([0-9]{4})(?!\d)", line)):
                 self._set_code(code.group(1))
-            if not line.startswith("[ASR ") and (code or "签到提醒" in line):
+            if not line.startswith("[ASR ") and (
+                    code or "签到提醒" in line or "签到成功" in line or "签到失败" in line):
                 self._record_activity(line)
                 activity_changed = True
             if "ASR 就绪" in line and self._task_kind == "monitor" and not self.stop_event.is_set():
@@ -1926,7 +2027,9 @@ class App(ctk.CTk):
         self._closing = True
         self.stop_event.set()
         self.b_monitor.configure(state="disabled", text="正在关闭…")
+        self.b_login.configure(state="disabled")
         self.b_test.configure(state="disabled")
+        self.b_locate.configure(state="disabled")
         self.b_url.configure(state="disabled")
         self.b_live_account.configure(state="disabled")
         self.b_live_login.configure(state="disabled")
@@ -1935,10 +2038,10 @@ class App(ctk.CTk):
         self._wait_for_monitor_close()
 
     def _wait_for_monitor_close(self):
-        # Wait for monitoring and live login cleanup.
+        # Wait for attendance cleanup or the bounded system-location helper.
         # Keep Tk responsive rather than abandoning a child process on exit.
         self._close_job = None
-        if self._task_kind in ("monitor", "live_login", "live_courses") and self.worker and self.worker.is_alive():
+        if self._task_kind in ("monitor", "location", "live_login", "live_courses") and self.worker and self.worker.is_alive():
             self._close_job = self.after(100, self._wait_for_monitor_close)
         else:
             self.destroy()

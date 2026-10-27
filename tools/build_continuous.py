@@ -24,7 +24,7 @@ from hdusign import __version__
 from tools.frozen_archive import read_exe, read_pyz, replace_pyz, write_exe
 
 BASE_SHA256 = "1ff68543727007a97f3746a30b851d76e04569007841e7d414ceb6d91194cafd"
-UPDATE_CONTENT = "移除自动签到及机器人复用"
+UPDATE_CONTENT = "连堂课多账号与自动签到"
 EXE_NAME = f"HDUSign-v{__version__}-{UPDATE_CONTENT}.exe"
 
 

@@ -184,7 +184,7 @@ def prepare_semantic_model() -> None:
 
 
 def source_hashes() -> dict[str, str]:
-    paths = [ROOT / name for name in ("requirements.txt", "config.example.yaml", "README.md", "LICENSE")]
+    paths = [ROOT / name for name in ("requirements.txt", "config.example.yaml", "README.md", "CHANGELOG.md", "LICENSE")]
     generated = tuple(ROOT / "tools" / "ffmpeg-build" / name for name in ("downloads", "work", "dist"))
     for folder in ("hdusign", "assets", "docs", "tools", "tests", ".github"):
         paths.extend(p for p in (ROOT / folder).rglob("*")
@@ -324,7 +324,7 @@ def build_release(ffmpeg_bundle: Path) -> None:
     require_files(packaged_ffmpeg, FFMPEG_FILES)
     if sha256(packaged_ffmpeg / "ffmpeg.exe") != ffmpeg["binary_sha256"]:
         raise RuntimeError("Packaging changed the FFmpeg executable; keep the original static binary.")
-    copy_files(ROOT, app, ["README.md", "LICENSE", "config.example.yaml"])
+    copy_files(ROOT, app, ["README.md", "CHANGELOG.md", "LICENSE", "config.example.yaml"])
     shutil.copytree(ROOT / "docs", app / "docs")
     shutil.copytree(ROOT / "assets" / "screenshots", app / "assets" / "screenshots")
     shutil.copytree(ROOT / "assets" / "licenses", app / "assets" / "licenses")
@@ -338,7 +338,8 @@ def build_release(ffmpeg_bundle: Path) -> None:
     archive = OUTPUT / f"HDUSign-{VERSION}-win64.zip"
     print(f"Creating {archive.name}", flush=True)
     forbidden = {"config.yaml", "secrets_local.json", "session_local.json", "browser_profile",
-                 "live_session.json", "live_profile"}
+                 "live_session.json", "live_profile", "accounts.json", "webhooks.json",
+                 "account_data", "notification_routes", "trajectory_library.json"}
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as package:
         for path in sorted(app.rglob("*")):
             relative = path.relative_to(DIST)

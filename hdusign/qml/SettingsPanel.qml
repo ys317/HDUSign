@@ -79,9 +79,29 @@ Flickable {
         }
 
         Heading { text: "声音来源" }
-        Toggle { caption: "后台直播音频"; description: "选择课程后直接接收直播声音，关闭时使用电脑声音。"; fieldKey: "live" }
+        Toggle { objectName: "liveAudioToggle"; visible: accountManager === null; caption: "后台直播音频"; description: "选择课程后直接接收直播声音，关闭时使用电脑声音。"; fieldKey: "live" }
+        UiText {
+            objectName: "liveAudioOnlyNotice"
+            visible: accountManager !== null
+            width: parent.width; wrapMode: Text.Wrap; color: Theme.muted; font.pixelSize: 13
+            text: "后台直播音频：多账号界面直接接收各账号课程的直播声音。"
+        }
         Field { viewport: panel; caption: "课程网址（选填）"; fieldKey: "url"; hint: "选课后自动填写，也可粘贴课程链接。" }
         UiButton { text: "打开课程页面 ↗"; outline: true; onClicked: appController.openCourse() }
+
+        Heading { text: "签到辅助" }
+        Toggle { objectName: "autoSignToggle"; caption: "自动签到"; description: "确认签到码后自动在当前账号的签到页面提交。"; fieldKey: "autoSign" }
+        Row {
+            width: parent.width; spacing: 12
+            Field { width: (parent.width - 12) / 2; viewport: panel; caption: "纬度"; fieldKey: "latitude" }
+            Field { width: (parent.width - 12) / 2; viewport: panel; caption: "经度"; fieldKey: "longitude" }
+        }
+        UiText { width: parent.width; text: appController.state.locationHint; wrapMode: Text.Wrap; color: Theme.muted; font.pixelSize: 13 }
+        Row {
+            spacing: 8
+            UiButton { objectName: "locateButton"; text: "获取当前位置"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("locate") }
+            UiButton { objectName: "signinButton"; text: "重新登录签到"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("signin") }
+        }
 
         Heading { text: "识别与通知" }
         Toggle { caption: "语义辅助识别"; description: "使用本地语义模型辅助判断签到提示。"; fieldKey: "semantic" }

@@ -16,6 +16,7 @@ import time
 import yaml
 
 from hdusign.alert import Alerter
+from hdusign.attendance import make_auto_signer
 from hdusign.audio import SAMPLE_RATE, LoopbackSource, StreamingASR, WavFileSource
 from hdusign.rules import RuleMatcher, SignInWatcher, build_matchers, extract_codes
 
@@ -70,12 +71,14 @@ def make_alerter(cfg: dict, dedup_override: float | None = None, clock=None) -> 
                    webhook_resolver=resolver)
 
 
-def make_watcher(cfg: dict, alerter: Alerter, stop=None, clock=None) -> SignInWatcher:
+def make_watcher(cfg: dict, alerter: Alerter, auto=None, stop=None, clock=None) -> SignInWatcher:
     cw = cfg.get("code_watch", {})
 
     def on_code(code: str, text: str):
         if stop is not None and stop.is_set():
             return
+        if auto is not None:
+            auto.submit(code)
         alerter.notify(text, "code", f"签到码: {code}")
 
     w = SignInWatcher(float(cw.get("window_seconds", 60)),
@@ -86,6 +89,8 @@ def make_watcher(cfg: dict, alerter: Alerter, stop=None, clock=None) -> SignInWa
                       early_code=bool(cw.get("early_code", True)),
                       early_stable_seconds=float(cw.get("early_stable_seconds", 0.4)))
     w.on_code = on_code
+    if auto is not None:
+        w.on_prepare = lambda: auto.prepare() if stop is None or not stop.is_set() else None
     return w
 
 
@@ -181,9 +186,12 @@ def cmd_run(cfg: dict, stop=None) -> None:
     src = LoopbackSource(cfg.get("device") or None, chunk)
     print(f"[i] 正在监听输出设备: {src.speaker_name} (内录环回)")
     alerter = make_alerter(cfg)
+    auto = make_auto_signer(cfg, alerter, stop)
     try:
+        if auto is not None:
+            auto.prepare()
         matchers = build_matchers(cfg)
-        watcher = make_watcher(cfg, alerter, stop)
+        watcher = make_watcher(cfg, alerter, auto, stop)
         print(f"[i] 匹配器: {[type(m).__name__ for m in matchers]}")
         asr = make_engine(cfg)
         if stop.is_set():
@@ -194,12 +202,15 @@ def cmd_run(cfg: dict, stop=None) -> None:
     except KeyboardInterrupt:
         stop.set()
         print("\n已停止")
+    finally:
+        if auto is not None:
+            auto.close()
 
 
 def cmd_run_live(cfg: dict, stop=None) -> None:
     """Read a single live stream without a playing browser or loopback capture."""
     from hdusign.live import LiveClient, LiveEnded, LiveError, LiveNotStarted, parse_live_page
-    from hdusign.lessons import DeadlineStop, LessonPlan, EARLY_START
+    from hdusign.lessons import DeadlineStop, LessonPlan, EARLY_START, LATE_END
     from hdusign.media import FFmpegAudioSource, MediaError, find_ffmpeg
 
     stop = stop if stop is not None else threading.Event()
@@ -213,6 +224,10 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
     executable = find_ffmpeg()
     from hdusign.diagnostics import Diagnostics
     diagnostics = Diagnostics(cfg, plan)
+    auto = None
+    # Keep one signer through link changes, but stop pending browser work at
+    # the end of the complete class rather than at the third-cell boundary.
+    sign_stop = DeadlineStop(stop, plan.ends[-1] + LATE_END) if plan is not None else stop
     asr = watcher = None
     failures = auth_failures = 0
     outage_started = None
@@ -230,6 +245,10 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
     try:
         with LiveClient(str(cfg.get("live_url") or ""), cfg) as client:
             alerter = make_alerter(cfg)
+            if not sign_stop.is_set():
+                auto = make_auto_signer(cfg, alerter, sign_stop)
+                if auto is not None:
+                    auto.prepare()
             print("[i] 直播状态: 正在连接")
             current_lesson = None
             while not stop.is_set():
@@ -287,7 +306,7 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
                         diagnostics.mark("model_ready")
                         if stop.is_set():
                             return
-                        watcher = make_watcher(cfg, alerter, stop)
+                        watcher = make_watcher(cfg, alerter, auto, sign_stop)
                         if stream_stop.is_set():
                             continue
                     source = FFmpegAudioSource(
@@ -415,7 +434,11 @@ def cmd_run_live(cfg: dict, stop=None) -> None:
         stop.set()
         print("\n已停止")
     finally:
-        diagnostics.close()
+        try:
+            if auto is not None:
+                auto.close()
+        finally:
+            diagnostics.close()
 
 
 def cmd_test(cfg: dict, wav: str, realtime: bool) -> None:
@@ -423,12 +446,19 @@ def cmd_test(cfg: dict, wav: str, realtime: bool) -> None:
     clock = AudioClock()
     src = WavFileSource(wav, float(cfg.get("chunk_seconds", 0.25)), realtime)
     alerter = make_alerter(cfg, dedup_override=0, clock=clock)
-    matchers = build_matchers(cfg)
-    watcher = make_watcher(cfg, alerter, stop, clock=clock)
-    asr = make_engine(cfg)
-    with closing(src.chunks()) as chunks:
-        run_pipeline(clock.advance(chunks), asr, matchers, alerter, watcher,
-                     stop=stop, clock=clock)
+    auto = make_auto_signer(cfg, alerter, stop)
+    completed = False
+    try:
+        matchers = build_matchers(cfg)
+        watcher = make_watcher(cfg, alerter, auto, stop, clock=clock)
+        asr = make_engine(cfg)
+        with closing(src.chunks()) as chunks:
+            run_pipeline(clock.advance(chunks), asr, matchers, alerter, watcher,
+                         stop=stop, clock=clock)
+        completed = True
+    finally:
+        if auto is not None:
+            auto.close(cancel=not completed)
 
 
 def cmd_demo(cfg: dict) -> None:

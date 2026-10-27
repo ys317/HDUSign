@@ -21,7 +21,7 @@ class ReleaseTests(unittest.TestCase):
     def test_source_manifest_excludes_runtime_logs_and_includes_build_workflow(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for name in ("requirements.txt", "config.example.yaml", "README.md", "LICENSE",
+            for name in ("requirements.txt", "config.example.yaml", "README.md", "CHANGELOG.md", "LICENSE",
                          "tests/test_sample.py", "tests/generated.jsonl",
                          "tools/ffmpeg-build/downloads/source.tar.xz",
                          ".github/workflows/ffmpeg-audio.yml"):

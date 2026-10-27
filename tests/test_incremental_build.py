@@ -39,7 +39,9 @@ class IncrementalBuildTests(unittest.TestCase):
         modules = build.project_modules()
         self.assertIn('hdusign.rules', modules)
         self.assertIn('hdusign.gui', modules)
-        self.assertNotIn('hdusign.attendance', modules)
+        self.assertIn('hdusign.attendance', modules)
+        self.assertIn('hdusign.captcha_boost', modules)
+        self.assertIn('hdusign.account_worker', modules)
         self.assertTrue(all(path.is_file() for path in modules.values()))
 
     def test_release_name_and_windows_resource_follow_version_and_content(self):

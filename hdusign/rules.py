@@ -158,6 +158,7 @@ class SignInWatcher:
         self._last_code: dict = {}
         self.codes_found: List[Tuple[str, str]] = []  # (code, source text)
         self.on_code = lambda code, text: None  # set by caller
+        self.on_prepare = lambda: None
         self.early_code = early_code
         self.early_stable_seconds = max(0.0, float(early_stable_seconds))
         self._partial_revision = -1
@@ -177,6 +178,7 @@ class SignInWatcher:
     def trigger(self, text: str, reason: str) -> None:
         now = self.clock()
         self.watch_until = now + self.window_seconds
+        self.on_prepare()
         print(f"\n{'=' * 62}")
         print(f"[监码窗口开启 {time.strftime('%H:%M:%S')}] 触发: {reason}")
         print(f"--- 触发前 {int(self.context_seconds)}s 上下文 ---")
@@ -191,7 +193,7 @@ class SignInWatcher:
                      cue: bool = False) -> List[Tuple[str, str]]:
         """Confirm a bounded digit span without waiting for the entire sentence.
 
-        A bare four-digit tail waits for final transcription. Early confirmation needs
+        A bare four-digit tail only prepares the browser. Early confirmation needs
         following nonnumeric speech or a second complete, identical reading,
         plus stability across actual decoder updates. Repeated calls while the
         decoder is buffering do not count as additional evidence.
@@ -207,6 +209,8 @@ class SignInWatcher:
         norm, codes = extract_codes(text)
         residue = norm.replace(codes[0], "", 1).strip() if codes else norm
         eligible = self.active or cue or (self.standalone_code and len(residue) <= 4)
+        if cue or (codes and eligible):
+            self.on_prepare()
         if not eligible:
             self._candidates.clear()
             return []

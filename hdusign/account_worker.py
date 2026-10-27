@@ -96,10 +96,12 @@ def worker_main(argv):
                 raise LiveLoginRequired("登录状态与当前账号不一致，请重新登录当前账号。")
         if action == "login":
             value = services.login(request["url"], stop, load_credentials(root), request["manual"])
-        elif action in ("monitor", "courses", "webhook"):
+        elif action in ("monitor", "courses", "webhook", "signin", "locate"):
             value = getattr(services, action)(cfg, stop)
             if action == "courses":
                 value = [asdict(item) for item in value]
+            elif action == "locate":
+                value = asdict(value)
         elif action == "isolation-check":
             # Offline diagnostics, also used to verify five concurrent workers.
             credentials = load_credentials(root)
@@ -153,7 +155,8 @@ def worker_main(argv):
     except Exception as exc:
         # Never return requests, signed URLs, cookies, credentials or tracebacks.
         from hdusign.live import LiveError
-        message = str(exc) if isinstance(exc, LiveError) else "账号任务失败，请检查网络、登录状态和运行环境。"
+        from hdusign.location import LocationError
+        message = str(exc) if isinstance(exc, (LiveError, LocationError)) else "账号任务失败，请检查网络、登录状态和运行环境。"
         print("[错误] " + message, flush=True)
         write_json(directory / "result.json", {"ok": False, "message": message})
         return 1
@@ -271,6 +274,9 @@ class ProcessServices:
             if action == "courses":
                 from hdusign.live import LiveCourse
                 return [LiveCourse(**row) for row in value]
+            if action == "locate":
+                from hdusign.location import Location
+                return Location(**value)
             return value
 
     def login(self, url, stop, credentials, manual=False):
@@ -282,7 +288,11 @@ class ProcessServices:
     def courses(self, cfg, stop):
         return self.run("courses", cfg, stop)
 
+    def signin(self, cfg, stop):
+        return self.run("signin", cfg, stop)
 
+    def locate(self, cfg, stop):
+        return self.run("locate", cfg, stop)
 
     def webhook(self, cfg, stop):
         return self.run("webhook", cfg, stop)

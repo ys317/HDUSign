@@ -25,6 +25,7 @@ def prepare_demo(root):
     cfg["live_url"] = live_course_url(demo_courses()[0])
     cfg["alert"]["webhook"]["url"] = ""
     cfg["rules"]["semantic"]["enabled"] = False
+    cfg.setdefault("auto_sign", {})["enabled"] = False
     cfg["ui"] = {"appearance": "dark"}
     (root / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
     (root / "secrets_local.json").write_text(json.dumps({
@@ -55,7 +56,7 @@ class DemoServices:
         print("[i] 演示模式：未调用外部服务。")
         return 0
 
-    webhook = _offline
+    locate = signin = webhook = _offline
 
 
 class DemoController(Controller):

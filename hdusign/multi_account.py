@@ -66,7 +66,10 @@ class ManagedController(Controller):
         self.account_store = manager.accounts
         self.cfg.setdefault("alert", {})["log_file"] = str(self.root / "alerts.jsonl")
         self.cfg.setdefault("code_watch", {})["log_file"] = str(self.root / "codes.jsonl")
-        self._form.update(username=username, password=password)
+        # The multi-account desktop always consumes each account's live stream.
+        # Normalize older loopback settings before hiding that unsupported mode.
+        self.cfg.setdefault("live_audio", {})["enabled"] = True
+        self._form.update(username=username, password=password, live=True)
         self.secrets.update(skl_username=username, skl_password=password)
         if getattr(services, "isolated", False):
             services.credentials = dict(self.secrets)
@@ -77,9 +80,12 @@ class ManagedController(Controller):
         if auto_load and username:
             self._startup_timer.start(350)
 
-    def _set_session_credentials(self, secrets):
+    def _prepare_session_credentials(self, secrets):
+        return dict(secrets)
+
+    def _commit_session_credentials(self, prepared):
         if getattr(self.services, "isolated", False):
-            self.services.credentials = dict(secrets)
+            self.services.credentials = prepared
         # No writes to os.environ in the parent GUI process.
 
     def apply_webhook(self, preserve_edits=False):
@@ -227,6 +233,17 @@ class ManagedController(Controller):
 
     @Slot(str)
     def runAction(self, action):
+        if action == "signin":
+            if self._task or self._state["closing"]:
+                return
+            username = self._form["username"].strip()
+            if not username:
+                self._feedback("请输入要登录签到的学号，方便隔离账号资料。", True, "username")
+                return
+            target = self.manager.for_login(self, username)
+            if target is not None:
+                Controller.runAction(target, action)
+            return
         if action != "webhook":
             return super().runAction(action)
         if self._task or self._state["closing"]:

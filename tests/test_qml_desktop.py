@@ -3,6 +3,9 @@ from pathlib import Path
 from dataclasses import replace
 import tempfile
 import unittest
+from unittest.mock import patch
+import shutil
+import sys
 
 import shiboken6
 from PySide6.QtCore import QObject, QPointF, Qt, qInstallMessageHandler
@@ -17,6 +20,23 @@ APP.setQuitOnLastWindowClosed(False)
 
 
 class QmlDesktopTests(unittest.TestCase):
+    def test_frozen_full_and_incremental_packages_load_their_bundled_qml(self):
+        from hdusign import __version__
+        source = Path(__file__).resolve().parents[1] / 'hdusign' / 'qml'
+        for layout in ('hdusign/qml', 'qml-' + __version__):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                shutil.copytree(source, root / layout)
+                with patch('hdusign.qt_app.resource_root', return_value=root), \
+                        patch.object(sys, 'frozen', True, create=True):
+                    engine, window = create_engine(self.c, APP)
+                try:
+                    QTest.qWait(50)
+                    self.assertIsNotNone(window.findChild(QObject, 'pageTitle'))
+                finally:
+                    window.setVisible(False)
+                    shiboken6.delete(engine)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -130,11 +150,13 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertEqual(self.item('pageBreadcrumb').property('text'), '设置')
         self.assertGreater(settings.width(), 700)
         self.assertTrue(self.item('field_username').isVisible())
-        for name in ('field_password', 'field_url',
+        for name in ('field_password', 'field_url', 'field_latitude', 'field_longitude',
                      'field_rules', 'field_webhook'):
             self.assertIsNotNone(self.item(name), name)
-        for name in ('field_latitude', 'field_longitude'):
-            self.assertIsNone(self.window.findChild(QObject, name))
+        for name in ('autoSignToggle', 'locateButton', 'signinButton'):
+            self.assertIsNotNone(self.window.findChild(QObject, name))
+        self.assertTrue(self.item('liveAudioToggle').isVisible())
+        self.assertFalse(self.item('liveAudioOnlyNotice').isVisible())
         self.assertIsNotNone(self.item('navLive'))
         self.assertIsNotNone(self.item('monitorButton'))
 

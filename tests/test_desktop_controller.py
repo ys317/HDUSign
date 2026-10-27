@@ -16,6 +16,7 @@ from PySide6.QtTest import QSignalSpy
 from hdusign.desktop_controller import Controller, Rows
 from hdusign.demo import DemoServices, demo_courses, prepare_demo
 from hdusign.live import LiveError, live_course_url
+from hdusign.location import Location
 
 
 APP = QGuiApplication.instance() or QGuiApplication([])
@@ -66,6 +67,21 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertNotIn(' spaces stay ', self.c.secrets_path.read_text())
         self.assertNotIn('password', str(cfg))
 
+
+    def test_invalid_coordinates_never_write(self):
+        original = self.c.config_path.read_bytes()
+        for value in ('NaN', 'inf', '-91', 'abc'):
+            self.c.setField('latitude', value)
+            self.assertFalse(self.c.save())
+            self.assertEqual(self.c._state['errorField'], 'latitude')
+            self.assertEqual(self.c.config_path.read_bytes(), original)
+
+    def test_location_does_not_overwrite_edits_made_during_request(self):
+        self.c._location_request = (self.c._form['latitude'], self.c._form['longitude'])
+        self.c.setField('latitude', '20.1')
+        self.c._finish('locate', False, Location(30.1, 120.2, 5))
+        self.assertEqual(self.c._form['latitude'], '20.1')
+        self.assertIn('保留', self.c._state['locationHint'])
 
     def test_theme_persists_without_saving_unsaved_fields(self):
         self.c.setField('webhook', 'https://example.invalid/unsaved')

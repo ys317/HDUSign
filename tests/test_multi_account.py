@@ -52,6 +52,14 @@ class IsolatedFakeServices:
         self.calls.append(copy.deepcopy(cfg))
         return self.webhook_result
 
+    def signin(self, cfg, stop):
+        self.calls.append(copy.deepcopy(self.credentials))
+        return 0
+
+    def locate(self, cfg, stop):
+        from hdusign.location import Location
+        return Location(30.123456, 120.654321, 5)
+
 
 class MultiAccountTests(unittest.TestCase):
     def setUp(self):
@@ -112,6 +120,27 @@ class MultiAccountTests(unittest.TestCase):
         self.manager.stopAll()
         self.drain(lambda: self.manager.monitor_count() == 0)
 
+    def test_legacy_loopback_setting_can_start_in_multi_account_desktop(self):
+        controller = self.manager.controllers['student-0']
+        cfg = yaml.safe_load(controller.config_path.read_text('utf-8'))
+        cfg['live_audio']['enabled'] = False
+        cfg['live_url'] = live_course_url(demo_courses()[0])
+        controller.config_path.write_text(yaml.safe_dump(cfg), encoding='utf-8')
+        other = AccountManager(self.root, services_factory=IsolatedFakeServices, auto_load=False)
+        restored = other.controllers['student-0']
+        try:
+            self.assertTrue(restored._form['live'])
+            self.assertTrue(restored.cfg['live_audio']['enabled'])
+            # Do not select a course: selection itself enables live audio and
+            # would conceal a broken migration of the old disabled setting.
+            self.assertTrue(restored.start_monitor())
+            self.assertTrue(yaml.safe_load(restored.config_path.read_text('utf-8'))['live_audio']['enabled'])
+        finally:
+            other.shutdown()
+            if restored.worker:
+                restored.worker.join(2)
+            restored.drain()
+
     def test_independent_reservations_survive_restart(self):
         first = self.select('student-0', True)
         second = self.select('student-1', True)
@@ -150,6 +179,44 @@ class MultiAccountTests(unittest.TestCase):
         self.assertIn('new-student', self.manager.accounts.accounts)
         self.assertFalse((draft.root / 'live_session.json').exists())
         self.assertFalse((self.root / 'live_session.json').exists())
+
+    def test_signin_from_new_account_uses_its_own_controller_and_credentials(self):
+        self.manager.activate('')
+        draft = self.manager.active
+        draft.setField('username', 'signin-student')
+        draft.setField('password', 'signin-password')
+        draft.runAction('signin')
+        target = self.manager.active
+        self.drain(lambda: not target._task)
+        self.assertEqual(target.account_username, 'signin-student')
+        self.assertEqual(target.root, self.manager.account_root('signin-student'))
+        self.assertNotEqual(target.root, draft.root)
+        self.assertEqual(target.services.calls, [{'skl_username': 'signin-student', 'skl_password': 'signin-password'}])
+
+    def test_second_save_write_failure_preserves_worker_credentials_and_reservations(self):
+        from hdusign.desktop_controller import write_text_atomic
+        controller = self.select('student-0', True)
+        previous_cfg = controller.config_path.read_bytes()
+        previous_credentials = dict(controller.services.credentials)
+        controller._form['password'] = 'uncommitted-edit'
+        writes = []
+
+        def fail_second(path, text):
+            writes.append(path)
+            if len(writes) == 2:
+                raise PermissionError('second save write failed')
+            write_text_atomic(path, text)
+
+        with patch('hdusign.desktop_controller.write_text_atomic', side_effect=fail_second):
+            controller.toggleMonitor()
+        self.assertEqual(controller.config_path.read_bytes(), previous_cfg)
+        self.assertEqual(controller.services.credentials, previous_credentials)
+        self.assertFalse(controller._schedules)
+        other = AccountManager(self.root, services_factory=IsolatedFakeServices, auto_load=False)
+        try:
+            self.assertFalse(other.controllers['student-0']._schedules)
+        finally:
+            other.shutdown()
 
     def test_webhook_is_saved_only_after_success_and_can_be_named_and_assigned(self):
         first = self.select('student-0')
@@ -312,6 +379,38 @@ class WebhookResponseTests(unittest.TestCase):
             response.read.return_value = json.dumps(body).encode()
             with self.subTest(body=body), patch('urllib.request.urlopen', return_value=response):
                 self.assertEqual(alerter._send_wechat('10:00', 'test', '测试', '测试'), expected)
+
+
+class AccountActionProtocolTests(unittest.TestCase):
+    def test_signin_and_location_actions_are_serializable_without_live_login(self):
+        from hdusign.account_worker import worker_main
+        from hdusign.accounts import load_credentials
+        from hdusign.location import Location
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = ProcessServices(root)
+            credentials = {'skl_username': 'action-student', 'skl_password': 'action-password'}
+            environment = service.environment(credentials)
+            for action in ('signin', 'locate'):
+                with self.subTest(action=action):
+                    write_json(root / 'request.json', dict(action=action, root=str(root),
+                               parent_pid=os.getpid(), config={'auto_sign': {'enabled': True}}))
+                    captured = []
+
+                    def fake_action(cfg, stop):
+                        captured.append(load_credentials(root))
+                        return Location(30.1, 120.2, 5) if action == 'locate' else 0
+
+                    with patch.dict(os.environ, environment, clear=True), \
+                            patch('hdusign.account_worker.os.chdir'), \
+                            patch('hdusign.desktop_controller.Services.' + action, side_effect=fake_action):
+                        self.assertEqual(worker_main([str(root)]), 0)
+                    self.assertEqual(captured, [credentials])
+                    result = read_json(root / 'result.json')
+                    self.assertTrue(result['ok'])
+                    self.assertEqual(result['value'], {'lat': 30.1, 'lng': 120.2, 'accuracy_m': 5}
+                                     if action == 'locate' else 0)
+            self.assertFalse((root / 'live_session.json').exists())
 
 
 if __name__ == '__main__':

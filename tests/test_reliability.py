@@ -20,12 +20,14 @@ import numpy as np
 from hdusign import browser
 from hdusign import monitor
 from hdusign.__main__ import main as app_main
+from hdusign.attendance import AutoSigner
 from hdusign.audio import LoopbackSource
+from hdusign.attendance import SignResult, classify_response
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class EntryAndProfileTests(unittest.TestCase):
+class SignResultTests(unittest.TestCase):
     def test_profile_cleanup_matches_only_the_exact_user_data_dir(self):
         profile = Path("D:/EchoSign/browser_profile/accounts/account-a")
         self.assertTrue(browser._commandline_uses_profile(
@@ -34,10 +36,83 @@ class EntryAndProfileTests(unittest.TestCase):
             f'chrome.exe --user-data-dir="{profile.parent}" --type=browser', profile))
         self.assertFalse(browser._commandline_uses_profile(str(profile), profile))
 
+    def test_business_failure_containing_success_word_stays_failure(self):
+        result = classify_response("1234", 200, {"code": 400, "message": "签到未成功，请重试"})
+        self.assertEqual(result.status, "failure")
 
+    def test_only_explicit_business_success_qualifies(self):
+        cases = [
+            (200, {"code": 200, "msg": "签到成功"}, "success"),
+            (200, {"code": "200"}, "success"),
+            (200, {"code": 200, "success": False}, "failure"),
+            (503, {"code": 200}, "failure"),
+            (200, {"code": 2000}, "failure"),
+            (200, {"code": True}, "unknown"),
+            (200, {"message": "成功"}, "unknown"),
+            (200, None, "unknown"),
+            (200, "签到成功", "unknown"),
+        ]
+        for http_status, payload, expected in cases:
+            with self.subTest(http_status=http_status, payload=payload):
+                self.assertEqual(classify_response("1234", http_status, payload).status, expected)
 
+    def test_response_must_match_endpoint_method_and_current_code(self):
+        endpoint = "https://skl.hdu.edu.cn/api/ali-nvc/captcha-verify"
+        cases = [
+            (endpoint + "?code=1234", "POST", True),
+            (endpoint + "?captchaVerifyParam=token&userid=42&code=1234&latitude=30.3&longitude=120.3&t=1",
+             "POST", True),
+            (endpoint + "?code=4321", "POST", False),
+            (endpoint + "?code=1234&code=4321", "POST", False),
+            (endpoint, "POST", False),
+            (endpoint + "?code=1234", "GET", False),
+            ("https://skl.hdu.edu.cn/api/login?code=1234", "POST", False),
+            ("https://example.com/api/ali-nvc/captcha-verify?code=1234", "POST", False),
+        ]
+        for url, method, expected in cases:
+            response = SimpleNamespace(url=url, request=SimpleNamespace(method=method))
+            with self.subTest(url=url, method=method):
+                self.assertEqual(browser.is_sign_response(response, "1234"), expected)
 
+    def test_browser_writes_structured_result_without_stdout(self):
+        for status in ("success", "failure", "unknown"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+                output = Path(folder) / "result.json"
+                progress = Path(folder) / "progress.json"
+                result = SignResult(status, "1234", "演示结果")
+                context = MagicMock()
+                context.pages = [MagicMock()]
+                runtime = MagicMock()
+                runtime.__enter__.return_value.chromium.launch_persistent_context.return_value = context
+                stack.enter_context(patch.object(browser, "sync_playwright", return_value=runtime))
+                stack.enter_context(patch.object(browser, "load_secrets", return_value={}))
+                stack.enter_context(patch.object(browser, "_cleanup_stale_profile"))
+                stack.enter_context(patch.object(browser, "_location", return_value=(0, 0)))
+                stack.enter_context(patch.object(browser, "ensure_logged_in"))
+                def sign_with_progress(*args, on_stage):
+                    on_stage("verification_required", 1)
+                    return result
+                stack.enter_context(patch.object(browser, "sign_with_code", side_effect=sign_with_progress))
+                stack.enter_context(patch.object(sys, "stdout", None))
+                exit_code = browser.sign(["1234", "--result-file", str(output), "--progress-file", str(progress)])
+                self.assertEqual(exit_code, result.exit_code)
+                self.assertEqual(SignResult.read(output, "1234"), result)
+                self.assertIn('"verification_required"', progress.read_text(encoding="utf-8"))
+                context.close.assert_called_once()
 
+    def test_frozen_entrypoint_preserves_result_file_argument(self):
+        captured = []
+        args = ["HDUSign.exe", "--sign", "1234", "--result-file", "result.json"]
+
+        def fake_main(argv):
+            captured.extend(argv)
+            return 1
+
+        with patch.object(sys, "frozen", True, create=True), patch.object(sys, "argv", args), \
+                patch("os.chdir"), patch.object(browser, "sign", side_effect=fake_main):
+            exit_code = app_main()
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(captured, ["1234", "--result-file", "result.json"])
 
     def test_source_entrypoint_routes_monitor_commands(self):
         with patch("os.chdir"), patch.object(monitor, "main", return_value=0) as command:
@@ -62,6 +137,70 @@ class EntryAndProfileTests(unittest.TestCase):
             self.assertEqual(stderr_data.getvalue().decode("utf-8"), "诊断：�\n")
 
 
+class DispatcherTests(unittest.TestCase):
+    def dispatch(self, result=None, stdout="", returncode=0, malformed=False, frozen=False):
+        notifications = []
+        commands = []
+        paths = []
+
+        def child(command, **_):
+            commands.append(command)
+            path = Path(command[command.index("--result-file") + 1])
+            paths.append(path)
+            if malformed:
+                path.write_text("{invalid", encoding="utf-8")
+            elif result is not None:
+                result.write(path)
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+        signer = AutoSigner(lambda reason, text: notifications.append((reason, text)))
+        with patch.object(signer, "_run_child", side_effect=child), \
+                patch.object(sys, "frozen", frozen, create=True), redirect_stdout(StringIO()):
+            signer._sign_one("1234")
+        self.assertEqual(len(notifications), 1)
+        self.assertTrue(all(not path.exists() for path in paths), "Temporary result files must be cleaned up")
+        return notifications[0], commands[0]
+
+    def test_log_text_cannot_report_success(self):
+        for text in ("签到未成功", '[结果] {"code":200}', "登录成功，签到失败"):
+            with self.subTest(text=text):
+                notification, _ = self.dispatch(stdout=text)
+                self.assertIn("结果未知", notification[0])
+
+    def test_explicit_failure_is_reported_even_when_message_contains_success(self):
+        result = SignResult("failure", "1234", "签到未成功")
+        notification, _ = self.dispatch(result=result, stdout="登录成功", returncode=1)
+        self.assertIn("自动签到失败", notification[0])
+
+    def test_success_works_for_source_and_windowed_exe_without_logs(self):
+        for frozen in (False, True):
+            with self.subTest(frozen=frozen):
+                notification, command = self.dispatch(SignResult("success", "1234", "OK"), stdout=None, frozen=frozen)
+                self.assertIn("自动签到成功", notification[0])
+                self.assertIn("--sign", command)
+                if frozen:
+                    self.assertEqual(command[:2], [sys.executable, "--sign"])
+                else:
+                    self.assertEqual(command[:5], [sys.executable, "-X", "utf8", "-m", "hdusign"])
+
+    def test_abnormal_exit_never_reports_success(self):
+        notification, _ = self.dispatch(SignResult("success", "1234", "OK"), returncode=1)
+        self.assertIn("结果未知", notification[0])
+
+    def test_mismatched_or_malformed_result_is_unknown(self):
+        for result, malformed in ((SignResult("success", "4321", "OK"), False), (None, True)):
+            with self.subTest(result=result, malformed=malformed):
+                notification, _ = self.dispatch(result=result, malformed=malformed)
+                self.assertIn("结果未知", notification[0])
+
+    def test_timeout_is_unknown_and_does_not_retry(self):
+        notifications = []
+        signer = AutoSigner(lambda reason, text: notifications.append((reason, text)))
+        with patch.object(signer, "_run_child", side_effect=subprocess.TimeoutExpired("test", 1)) as run, \
+                redirect_stdout(StringIO()):
+            signer._sign_one("1234")
+        run.assert_called_once()
+        self.assertIn("结果未知", notifications[0][0])
 
 
 class FakeRecorder:
@@ -238,21 +377,36 @@ class CaptureTests(unittest.TestCase):
         alerter.notify.assert_not_called()
         watcher.feed.assert_not_called()
 
-    def test_stopped_watcher_does_not_notify(self):
+    def test_stopped_watcher_does_not_queue_a_browser_task(self):
         stop = threading.Event()
-        alerter = MagicMock()
-        watcher = monitor.make_watcher({}, alerter, stop)
+        alerter, signer = MagicMock(), MagicMock()
+        watcher = monitor.make_watcher({}, alerter, signer, stop)
         stop.set()
         watcher.on_code("1234", "签到码1234")
         alerter.notify.assert_not_called()
+        signer.submit.assert_not_called()
 
+    def test_monitor_closes_signer_even_if_model_initialization_fails(self):
+        signer = MagicMock()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(monitor, "LoopbackSource"))
+            stack.enter_context(patch.object(monitor, "make_alerter"))
+            stack.enter_context(patch.object(monitor, "make_auto_signer", return_value=signer))
+            stack.enter_context(patch.object(monitor, "build_matchers", return_value=[]))
+            stack.enter_context(patch.object(monitor, "make_engine", side_effect=RuntimeError("model error")))
+            stack.enter_context(redirect_stdout(StringIO()))
+            with self.assertRaisesRegex(RuntimeError, "model error"):
+                monitor.cmd_run({})
+        signer.close.assert_called_once_with()
 
-    def test_wav_replay_closes_source_on_completion_and_failure(self):
+    def test_wav_replay_drains_on_completion_and_cancels_on_failure(self):
         for error in (None, RuntimeError("decode failed")):
             with self.subTest(error=error), ExitStack() as stack:
+                signer = MagicMock()
                 source = MagicMock()
                 stack.enter_context(patch.object(monitor, "WavFileSource", return_value=source))
                 stack.enter_context(patch.object(monitor, "make_alerter"))
+                stack.enter_context(patch.object(monitor, "make_auto_signer", return_value=signer))
                 stack.enter_context(patch.object(monitor, "build_matchers", return_value=[]))
                 stack.enter_context(patch.object(monitor, "make_engine"))
                 stack.enter_context(patch.object(monitor, "run_pipeline", side_effect=error))
@@ -261,6 +415,7 @@ class CaptureTests(unittest.TestCase):
                         monitor.cmd_test({}, "fake.wav", False)
                 else:
                     monitor.cmd_test({}, "fake.wav", False)
+                signer.close.assert_called_once_with(cancel=error is not None)
                 source.chunks.return_value.close.assert_called_once_with()
 
 

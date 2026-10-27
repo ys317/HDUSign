@@ -81,18 +81,48 @@ class GuiTests(unittest.TestCase):
         self.fail("GUI task did not reach the expected state")
 
     def test_saves_fields_without_discarding_other_settings(self):
+        self.app.v_auto.set(True)
         self.app.v_sem.set(False)
+        self.app.v_lat.set(" 30.25 ")
         self.app.v_user.set(" demo-updated ")
         self.assertTrue(self.app.save_cfg())
         saved = yaml.safe_load(ui.CONFIG.read_text(encoding="utf-8"))
-        self.assertNotIn("location", saved)
-        self.assertNotIn("auto_sign", saved)
+        self.assertEqual(saved["location"]["lat"], 30.25)
+        self.assertTrue(saved["auto_sign"]["enabled"])
         self.assertFalse(saved["rules"]["semantic"]["enabled"])
         self.assertEqual(saved["device"], "test-device")
         self.assertEqual(saved["alert"]["webhook"]["levels"], ["high", "code"])
+        self.assertEqual(saved["auto_sign"]["timeout_seconds"], 180)
         self.assertEqual(json.loads(ui.SECRETS.read_text())["skl_username"], "demo-updated")
 
+    def test_invalid_coordinates_do_not_write_files(self):
+        original = ui.CONFIG.read_bytes(), ui.SECRETS.read_bytes()
+        for value in ("", " ", "not a number", "nan", "inf", "91", "-91"):
+            with self.subTest(value=value):
+                self.app.v_lat.set(value)
+                self.assertFalse(self.app.save_cfg())
+                self.assertEqual(original, (ui.CONFIG.read_bytes(), ui.SECRETS.read_bytes()))
+                self.assertEqual(self.app._active_tab, "extras")
+                self.assertTrue(self.app._entries["lat"].invalid)
+        self.app.v_lat.set("30")
+        self.app.v_lng.set("181")
+        self.assertFalse(self.app.save_cfg())
 
+    def test_location_defaults_and_saved_values_reach_the_browser(self):
+        from hdusign import browser
+
+        self.app.cfg.pop("location")
+        self.app._load_fields()
+        self.assertEqual(self.app.v_lat.get(), "30.314732")
+        self.assertEqual(self.app.v_lng.get(), "120.343727")
+        self.assertTrue(self.app.save_cfg())
+        with patch.object(browser, "ROOT", self.root):
+            self.assertEqual(browser._location(), (30.314732, 120.343727))
+        self.app.v_lat.set("31.123456")
+        self.app.v_lng.set("121.654321")
+        self.assertTrue(self.app.save_cfg())
+        with patch.object(browser, "ROOT", self.root):
+            self.assertEqual(browser._location(), (31.123456, 121.654321))
 
     def test_monitor_can_start_with_empty_live_url(self):
         self.app.v_url.set("")
@@ -323,13 +353,76 @@ class GuiTests(unittest.TestCase):
         release.set()
         self.pump_until(lambda: self.app._task_kind is None)
 
+    def test_location_runs_in_background_and_is_applied_on_main_thread(self):
+        original = ui.CONFIG.read_bytes(), ui.SECRETS.read_bytes()
+        previous = self.app.v_lat.get(), self.app.v_lng.get()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        caller_threads = []
+        main_thread = threading.get_ident()
+        original_set = self.app.v_lat.set
 
+        def record_set(value):
+            caller_threads.append(threading.get_ident())
+            original_set(value)
 
+        def locate():
+            release.wait(2)
+            return ui.Location(30.321456, 120.345678, 48)
+
+        with patch.object(ui, "get_current_location", side_effect=locate), \
+                patch.object(self.app.v_lat, "set", side_effect=record_set):
+            self.app.locate()
+            self.assertEqual(self.app._task_kind, "location")
+            self.assertEqual(self.app.b_locate.cget("state"), "disabled")
+            self.assertEqual(self.app.b_monitor.cget("state"), "disabled")
+            self.assertEqual((self.app.v_lat.get(), self.app.v_lng.get()), previous)
+            release.set()
+            self.pump_until(lambda: self.app._task_kind is None)
+        self.assertEqual(caller_threads, [main_thread])
+        self.assertEqual((self.app.v_lat.get(), self.app.v_lng.get()), ("30.321456", "120.345678"))
+        self.assertIn("48 米", self.app._location_hint.cget("text"))
+        self.assertIn("未保存", self.app._save_state.cget("text"))
+        self.assertEqual(original, (ui.CONFIG.read_bytes(), ui.SECRETS.read_bytes()))
+        self.assertEqual(self.app.b_locate.cget("state"), "normal")
+        self.assertEqual(self.app.b_monitor.cget("state"), "normal")
+        self.assertTrue(self.app.save_cfg())
+        self.assertEqual(yaml.safe_load(ui.CONFIG.read_text(encoding="utf-8"))["location"],
+                         {"lat": 30.321456, "lng": 120.345678})
+
+    def test_failed_location_preserves_coordinates_and_recovers_controls(self):
+        before = self.app.v_lat.get(), self.app.v_lng.get()
+        with patch.object(ui, "get_current_location", side_effect=ui.LocationError("Windows 定位已关闭")):
+            self.app.locate()
+            self.pump_until(lambda: self.app._task_kind is None)
+        self.assertEqual((self.app.v_lat.get(), self.app.v_lng.get()), before)
+        self.assertIn("定位已关闭", self.app._location_hint.cget("text"))
+        self.assertEqual(self.app.b_locate.cget("state"), "normal")
+        self.assertEqual(self.app.b_monitor.cget("state"), "normal")
+
+    def test_location_does_not_overwrite_edits_made_while_waiting(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def locate():
+            release.wait(2)
+            return ui.Location(30.321456, 120.345678, 48)
+
+        with patch.object(ui, "get_current_location", side_effect=locate):
+            self.app.locate()
+            self.app.v_lat.set("32.123456")
+            self.app.v_lng.set("121.234567")
+            release.set()
+            self.pump_until(lambda: self.app._task_kind is None)
+        self.assertEqual((self.app.v_lat.get(), self.app.v_lng.get()), ("32.123456", "121.234567"))
+        self.assertIn("保留当前填写", self.app._location_hint.cget("text"))
 
     def test_actions_do_not_start_after_validation_failure(self):
+        self.app.v_lng.set("invalid")
         self.app.v_hook.set("https://example.com/webhook")
-        with patch.object(self.app, "save_cfg", return_value=False), patch.object(self.app, "_worker") as worker:
+        with patch.object(self.app, "_worker") as worker:
             self.app.start_monitor()
+            self.app.do_login()
             self.app.test_webhook()
             worker.assert_not_called()
 

@@ -4,12 +4,15 @@ chunk_seconds: 0.25 # 每次送给 ASR 的音频块长度
 
 # ====== 启动音频诊断 ======
 diagnostics:
-  enabled: true # 默认开启；可在设置中关闭并保存，最多保存启动阶段 180 秒音频
+  enabled: true # 可在设置中关闭；最多保存启动阶段 180 秒音频
 
 # ====== 课堂 ======
 live_url: "" # 选择直播课程后自动填写；也可在设置中手动填写
 live_audio:
   enabled: true # 默认直接接收直播音频；设置中可关闭并使用电脑声音
+location: # 「设置」页可获取 Windows 当前位置或手动填写，请核对后保存
+  lat: 30.314732
+  lng: 120.343727
 
 # ====== ASR 引擎 ======
 asr:
@@ -62,6 +65,13 @@ code_watch:
   early_code: true       # 数字后已出现非数字内容或完整重复报码时，可在整句结束前确认
   early_stable_seconds: 0.4 # 至少两次实际解码一致；只有四位尾串时仍等待完整结果
   log_file: codes.jsonl
+
+# ====== 全自动签到 ======
+auto_sign:
+  enabled: true            # 听到签到码后自动打开浏览器完成签到(依赖 browser_profile 登录态)
+  timeout_seconds: 180  # 签到任务总时限（30–1800 秒）；提交后为手动验证码与签到结果最多等待 120 秒
+  prewarm_browser: true  # 启动监控时打开签到页，确认码后才输入并提交
+  captcha_trajectory: true  # 可关闭的轨迹增强；人工接手时停止注入，样本按账号保存
 
 # ====== 浏览器网络 ======
 browser:

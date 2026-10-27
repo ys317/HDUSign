@@ -88,6 +88,29 @@ class MultipleReservationTests(unittest.TestCase):
         self.assertEqual(self.c._state['actionText'], '预约直播')
         self.assertEqual(self.c._state['reservationCount'], 1)
 
+    def test_second_save_write_failure_does_not_restore_rejected_booking(self):
+        from hdusign.desktop_controller import write_text_atomic
+        from hdusign.accounts import SESSION_ENV
+        import os
+        self.book(0)
+        original = self.c.config_path.read_bytes()
+        credentials = os.environ.get(SESSION_ENV)
+        writes = []
+
+        def fail_second(path, text):
+            writes.append(path)
+            if len(writes) == 2:
+                raise PermissionError('second save write failed')
+            write_text_atomic(path, text)
+
+        with patch('hdusign.desktop_controller.write_text_atomic', side_effect=fail_second):
+            self.book(1)
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(self.c.config_path.read_bytes(), original)
+        self.assertEqual(self.c._schedules, self.courses[:1])
+        self.assertEqual(self.restored()._schedules, self.courses[:1])
+        self.assertEqual(os.environ.get(SESSION_ENV), credentials)
+
     def test_multiple_bookings_sort_restore_and_cancel_only_the_chosen_course(self):
         for i in (2, 0, 1):
             self.book(i)

@@ -7,7 +7,7 @@ import sys
 
 
 def main(argv=None) -> int:
-    from hdusign.runtime import application_root, configure_qt_runtime
+    from hdusign.runtime import data_root, configure_qt_runtime
 
     # Windowed executables can inherit GBK-encoded redirected handles. ASR text
     # must not crash logging, and worker logs are read as UTF-8.
@@ -17,9 +17,15 @@ def main(argv=None) -> int:
             # Frozen Python can ignore PYTHONUNBUFFERED. Startup messages must
             # reach the GUI before the first nonempty ASR partial flushes stdout.
             reconfigure(encoding="utf-8", errors="replace", line_buffering=True, write_through=True)
-    os.chdir(application_root())
+    os.chdir(data_root())
     configure_qt_runtime()
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "--sign-worker":
+        from hdusign.browser import sign_worker
+        return sign_worker(args[1:])
+    if args and args[0] == "--sign":
+        from hdusign.browser import sign
+        return sign(args[1:])
     if args and args[0] == "--account-worker":
         from hdusign.account_worker import worker_main
         return worker_main(args[1:])
@@ -33,12 +39,16 @@ def main(argv=None) -> int:
     from hdusign import __version__
 
     parser.add_argument("--version", action="version", version=f"HDUSign v{__version__}")
+    parser.add_argument("--login", action="store_true", help="打开浏览器，登录上课啦")
     parser.add_argument("--check-runtime", metavar="REPORT", help=argparse.SUPPRESS)
     options = parser.parse_args(args)
     if options.check_runtime:
         from hdusign.runtime import check_runtime
 
         return check_runtime(options.check_runtime)
+    if options.login:
+        from hdusign.browser import login
+        return login()
     from hdusign.qt_app import main as gui_main
 
     return gui_main()

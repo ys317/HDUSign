@@ -10,6 +10,7 @@ from dataclasses import asdict
 import datetime as dt
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import re
@@ -27,6 +28,7 @@ from PySide6.QtQml import QQmlPropertyMap
 from hdusign import __version__
 from hdusign.accounts import AccountStore, load_credentials, protect, session_credentials
 from hdusign.live import LiveCourse, LiveError, live_course_url, parse_live_origin, parse_live_page
+from hdusign.location import DEFAULT_LAT, DEFAULT_LNG, Location
 from hdusign.runtime import application_root, resource_root
 
 ZONE = dt.timezone(dt.timedelta(hours=8))
@@ -110,8 +112,13 @@ class Services:
         return login_live(url, stop, switch_account=manual,
                           credentials=None if manual else credentials)
 
+    def signin(self, cfg, stop):
+        from hdusign.browser import login
+        return login(stop=stop)
 
-
+    def locate(self, cfg, stop):
+        from hdusign.location import get_current_location
+        return get_current_location()
     def webhook(self, cfg, stop):
         from hdusign.monitor import cmd_webhook_test
         return cmd_webhook_test(cfg)
@@ -174,7 +181,7 @@ class Controller(QObject):
                            closing=False, needsLogin=False, copied=False, scheduled=False,
                            accountMonitoring=False, reservationCount=0, runningTitle="", runningUrl="",
                            runningRobotName="", runningRobotPending=False,
-                           dirty=False)
+                           locationHint="核对坐标后保存。", dirty=False)
         error = ""
         try:
             self.cfg = read_mapping(self.config_path if self.config_path.exists()
@@ -209,7 +216,10 @@ class Controller(QObject):
             remember=True,
             webhookName="",
             webhook=str(self.cfg.get("alert", {}).get("webhook", {}).get("url", "") or ""),
+            latitude=str(self.cfg.get("location", {}).get("lat", DEFAULT_LAT)),
+            longitude=str(self.cfg.get("location", {}).get("lng", DEFAULT_LNG)),
             live=bool(self.cfg.get("live_audio", {}).get("enabled", True)),
+            autoSign=bool(self.cfg.get("auto_sign", {}).get("enabled", True)),
             semantic=bool(self.cfg.get("rules", {}).get("semantic", {}).get("enabled", False)),
             diagnostic=bool(self.cfg.get("diagnostics", {}).get("enabled", True)),
             rules="\n".join(str(s) for s in self.cfg.get("rules", {}).get("strong", [])))
@@ -357,7 +367,7 @@ class Controller(QObject):
             return
         if self._task and key in ("username", "password", "remember"):
             return
-        value = bool(value) if key in ("live", "semantic", "remember", "diagnostic") else str(value)
+        value = bool(value) if key in ("live", "autoSign", "semantic", "remember", "diagnostic") else str(value)
         if self._form[key] == value:
             return
         if key in ("username", "password") and self._scheduled:
@@ -424,36 +434,55 @@ class Controller(QObject):
 
     @Slot(result=bool)
     def save(self):
+        coords = {}
+        for key, title, limit in (("latitude", "纬度", 90), ("longitude", "经度", 180)):
+            try:
+                number = float(self._form[key].strip())
+                if not math.isfinite(number) or abs(number) > limit:
+                    raise ValueError
+            except ValueError:
+                self._feedback(f"{title}须为 {-limit} 到 {limit} 的数字", True, key)
+                return False
+            coords["lat" if key == "latitude" else "lng"] = number
         cfg, secrets = copy.deepcopy(self.cfg), copy.deepcopy(self.secrets)
         cfg["live_url"] = self._form["url"].strip()
         cfg.setdefault("ui", {})["appearance"] = "dark" if self._state["dark"] else "light"
         cfg.setdefault("live_audio", {})["enabled"] = self._form["live"]
         cfg.setdefault("alert", {}).setdefault("webhook", {})["url"] = self._form["webhook"].strip()
-        cfg.pop("auto_sign", None)
-        cfg.pop("location", None)
+        cfg.setdefault("auto_sign", {})["enabled"] = self._form["autoSign"]
+        cfg.setdefault("location", {}).update(coords)
         cfg.setdefault("rules", {}).setdefault("semantic", {})["enabled"] = self._form["semantic"]
         cfg.setdefault("diagnostics", {})["enabled"] = self._form["diagnostic"]
         cfg["rules"]["strong"] = [s.strip() for s in self._form["rules"].splitlines() if s.strip()]
         self._schedule_config(cfg, self._schedules)
         secrets.update(skl_username=self._form["username"].strip(), skl_password=self._form["password"])
         try:
-            write_text_atomic(self.config_path, yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
             disk_secrets = read_mapping(self.secrets_path)
             # General settings never save unverified edits to account credentials.
             disk_secrets.update({k: v for k, v in secrets.items()
                                  if k not in ("skl_username", "skl_password", "skl_password_dpapi")})
+            prepared = self._prepare_session_credentials(secrets)
+            # The config is the authoritative reservation/robot record. Commit
+            # it last so a failed supporting write cannot create a booking that
+            # the UI rejected but a later startup would restore.
             write_text_atomic(self.secrets_path, json.dumps(disk_secrets, ensure_ascii=False, indent=2))
-            self._set_session_credentials(secrets)
+            write_text_atomic(self.config_path, yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False))
         except OSError as exc:
             self._feedback(f"保存失败：{exc.strerror or '无法写入配置'}", True)
             return False
+        self._commit_session_credentials(prepared)
         self.cfg, self.secrets = cfg, secrets
         self._saved_form = dict(self._form)
         self._publish(dirty=False, feedback="设置已保存", feedbackError=False, errorField="")
         return True
 
-    def _set_session_credentials(self, secrets):
-        session_credentials(self.root, secrets)
+    def _prepare_session_credentials(self, secrets):
+        environment = {}
+        session_credentials(self.root, secrets, environment=environment)
+        return environment
+
+    def _commit_session_credentials(self, prepared):
+        os.environ.update(prepared)
 
     @Slot()
     def toggleTheme(self):
@@ -758,13 +787,14 @@ class Controller(QObject):
 
     @Slot(str)
     def runAction(self, action):
-        if self._task or self._state["closing"] or action != "webhook":
+        if self._task or self._state["closing"] or action not in ("locate", "signin", "webhook"):
             return
         if action == "webhook" and not self._valid_url(self._form["webhook"]):
             self._feedback("请填写有效的企业微信 Webhook 地址", True, "webhook")
             return
-        if not self.save():
+        if action != "locate" and not self.save():
             return
+        self._location_request = (self._form["latitude"], self._form["longitude"])
         cfg = copy.deepcopy(self.cfg)
         if action == "webhook":
             selected = self._selected()
@@ -820,7 +850,7 @@ class Controller(QObject):
         self.stop_event.clear()
         self._task = kind
         captions = dict(monitor="正在启动", courses="读取直播课", login="登录直播",
-                        webhook="测试通知")
+                        signin="登录签到", locate="正在定位", webhook="测试通知")
         self._publish(stopping=False)
         publish = self._task_publish if kind == "monitor" else self._publish
         publish(status=captions[kind], statusKind="waiting")
@@ -861,7 +891,7 @@ class Controller(QObject):
             self._update_elapsed()
             self._started = None
         failure_status = dict(monitor="监控异常", courses="课程加载失败", login="登录未完成",
-                              webhook="通知失败")
+                              signin="签到登录失败", locate="定位失败", webhook="通知失败")
         self._publish(stopping=False)
         publish = self._task_publish if kind == "monitor" else self._publish
         publish(status=failure_status.get(kind, "任务异常") if failed else "已停止" if kind == "monitor" else "就绪",
@@ -913,6 +943,17 @@ class Controller(QObject):
                 self.refreshCourses()
             else:
                 self._feedback("登录未完成，请核对账号或完成浏览器验证。", True, "username")
+        elif kind == "locate":
+            if not failed and isinstance(result, Location):
+                if self._location_request == (self._form["latitude"], self._form["longitude"]):
+                    self._form.update(latitude=f"{result.lat:.6f}", longitude=f"{result.lng:.6f}")
+                    self.formChanged.emit()
+                    accuracy = f"，误差约 {result.accuracy_m:.0f} 米" if result.accuracy_m is not None else ""
+                    self._publish(dirty=self._form != self._saved_form, locationHint=f"已获取{accuracy}，请核对后保存。")
+                else:
+                    self._publish(locationHint="坐标已手动修改，保留当前填写。")
+            else:
+                self._publish(locationHint=str(result) if isinstance(result, Exception) else "定位失败，请手动填写。")
         if self._scheduled and not self._task:
             self._show_schedule()
 
@@ -1010,7 +1051,7 @@ class Controller(QObject):
             text = re.sub(r"^\[(?:ASR [^\]]+|i|OK)\]\s*", "", line)
             entry = dict(time=time.strftime("%H:%M:%S"), text=text, kind=kind)
             logs.append(entry)
-            if not asr and (code or "签到提醒" in line):
+            if not asr and (code or any(word in line for word in ("签到提醒", "签到成功", "签到失败"))):
                 activity.append(entry)
         url = self._monitor_url if self._monitor_url is not None else self._state["selectedUrl"]
         for storage, entries, limit in ((self._course_logs, logs, self.log_model.limit),

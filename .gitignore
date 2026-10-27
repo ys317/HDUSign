@@ -23,3 +23,16 @@ build/
 sign_out.txt
 sign_err.txt
 *.zip
+captcha-research/.ak.txt
+captcha-research/experiments/
+trajectory_library.json
+
+# 多账号本地资料与诊断
+accounts.json
+webhooks.json
+account_data/
+notification_routes/
+logs/
+
+# 安全审计：被动观察的原始流量含令牌，仅本地保留
+security-audit/evidence/raw-*

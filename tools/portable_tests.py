@@ -18,6 +18,7 @@ import zlib
 
 SOURCE = Path(__file__).resolve().parents[1]
 PORTABLE = SOURCE.parent
+os.environ["HDUSIGN_PORTABLE_DEPENDENCIES"] = "1"
 sys.path[:0] = [str(SOURCE), str(SOURCE / "tests"), str(PORTABLE / "_internal")]
 from tools.frozen_archive import read_exe, read_pyz
 

@@ -8,7 +8,9 @@ import threading
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tools import portable_tests
+import os
+if os.environ.get("HDUSIGN_PORTABLE_DEPENDENCIES") == "1":
+    from tools import portable_tests
 from hdusign.accounts import write_json
 from hdusign.account_worker import ProcessServices
 
