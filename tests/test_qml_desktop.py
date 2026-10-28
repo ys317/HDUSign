@@ -160,6 +160,26 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertIsNotNone(self.item('navLive'))
         self.assertIsNotNone(self.item('monitorButton'))
 
+    def test_global_glass_slider_previews_and_saves_separately_from_account(self):
+        from hdusign.appearance import Appearance
+        self.click('navSettings')
+        settings = self.item('settingsPage')
+        settings.setProperty('contentY', max(0, settings.property('contentHeight') - settings.height()))
+        QTest.qWait(30)
+        appearance = self.engine.rootContext().contextProperty('appearance')
+        account_before = self.c.config_path.read_bytes()
+        slider = self.item('glassSlider_transparency')
+        pos = slider.mapToScene(QPointF(slider.width() * .8, slider.height() / 2)).toPoint()
+        QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, pos)
+        QTest.qWait(30)
+        self.assertGreater(appearance.values.value('transparency'), 70)
+        self.assertTrue(appearance.dirty)
+        self.click('saveGlassButton')
+        restored = Appearance(self.root)
+        self.assertEqual(restored.values.value('transparency'), appearance.values.value('transparency'))
+        self.assertFalse(appearance.dirty)
+        self.assertEqual(self.c.config_path.read_bytes(), account_before)
+
     def test_course_page_title_and_breadcrumb_follow_selection(self):
         self.assertEqual(self.window.property('title'), '')
         self.assertEqual(self.item('pageBreadcrumb').property('text'), '计算机网络')

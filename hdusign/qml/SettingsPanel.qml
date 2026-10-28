@@ -162,6 +162,62 @@ Flickable {
         }
         Field { viewport: panel; caption: "企业微信 Webhook"; fieldKey: "webhook"; secret: true; enabled: !appController.state.busy }
         UiButton { objectName: "testWebhookButton"; text: accountManager ? "测试推送并保存机器人" : "测试推送"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("webhook") }
+        Heading { text: "全局玻璃外观" }
+        Switch {
+            id: glassSwitch
+            objectName: "glassEnabledSwitch"
+            text: "桌面透视玻璃"
+            checked: appearance.values.enabled
+            onToggled: appearance.setValue("enabled", checked)
+            palette.windowText: Theme.text
+            indicator: Rectangle {
+                implicitWidth: 32; implicitHeight: 18
+                x: glassSwitch.leftPadding; y: (glassSwitch.height - height) / 2
+                radius: 9; color: glassSwitch.checked ? Theme.accent : Theme.outline
+                Rectangle { x: glassSwitch.checked ? 16 : 2; y: 2; width: 14; height: 14; radius: 7; color: "#ffffff" }
+            }
+        }
+        UiText { width: parent.width; text: appearance.status; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap }
+        component GlassSlider: Column {
+            property string caption
+            property string settingKey
+            width: parent.width; spacing: 3
+            UiText { text: parent.caption + " · " + appearance.values[parent.settingKey] + "%"; color: Theme.text; font.pixelSize: 13 }
+            Slider {
+                id: glassSlider
+                objectName: "glassSlider_" + parent.settingKey
+                width: Math.min(420, parent.width)
+                from: 0; to: 100; stepSize: 1
+                value: appearance.values[parent.settingKey]
+                enabled: appearance.values.enabled
+                onMoved: appearance.setValue(parent.settingKey, value)
+                background: Rectangle {
+                    x: glassSlider.leftPadding; y: glassSlider.topPadding + glassSlider.availableHeight / 2 - height / 2
+                    width: glassSlider.availableWidth; height: 4; radius: 2; color: Theme.outline
+                    Rectangle { width: glassSlider.visualPosition * parent.width; height: parent.height; radius: 2; color: Theme.accent }
+                }
+                handle: Rectangle {
+                    x: glassSlider.leftPadding + glassSlider.visualPosition * (glassSlider.availableWidth - width)
+                    y: glassSlider.topPadding + glassSlider.availableHeight / 2 - height / 2
+                    width: 16; height: 16; radius: 8; color: "#ffffff"
+                    border.width: 2; border.color: glassSlider.pressed ? Theme.accentHover : Theme.accent
+                }
+            }
+        }
+        GlassSlider { caption: "背景透视程度"; settingKey: "transparency" }
+        GlassSlider { caption: "玻璃着色浓度"; settingKey: "tint" }
+        GlassSlider { caption: "液态边缘高光"; settingKey: "highlight" }
+        UiText {
+            width: parent.width; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap
+            text: "即时预览，保存后对所有账号生效。系统负责桌面模糊，以上滑块调整透视、着色与高光；系统关闭透明效果时可能显示为实色。"
+        }
+        Row {
+            spacing: 8
+            UiButton { objectName: "saveGlassButton"; text: appearance.dirty ? "保存全局外观" : "外观已保存"; enabled: appearance.dirty; outline: true; onClicked: appearance.save() }
+            UiButton { text: "恢复默认外观"; outline: true; onClicked: appearance.reset() }
+        }
+        UiText { width: parent.width; visible: appearance.feedback.length > 0; text: appearance.feedback; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap }
+
         Item { width: 1; height: 12 }
         UiText { text: appController.state.version; color: Theme.subtle; font.pixelSize: 11 }
     }

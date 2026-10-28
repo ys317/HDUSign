@@ -51,7 +51,7 @@ class CodeExtractionTests(unittest.TestCase):
 
 
 class MatcherTests(unittest.TestCase):
-    def test_attendance_phrases_do_not_match_time_ranges(self):
+    def test_attendance_phrases_include_requested_broad_keywords(self):
         template = Path(__file__).resolve().parents[1] / "config.example.yaml"
         rules = yaml.safe_load(template.read_text(encoding="utf-8"))["rules"]
         matcher = RuleMatcher(rules["strong"], rules["weak_groups"])
@@ -59,10 +59,16 @@ class MatcherTests(unittest.TestCase):
             ("那我们先点个到，然后开始做作业", "high"),
             ("现在开始点名了", "high"),
             ("二三三零", None),
-            ("我们三点到五点再开始写作业", None),
-            ("从两点到四点都是自习课", None),
-            ("从源节点到目的节点转发数据包", None),
-            ("这个节点到另一个节点的地址", None),
+            ("请大家打开上课啦", "high"),
+            ("上课啦里面有通知", "high"),
+            ("手机打开一下", "high"),
+            ("请打开手机", "high"),
+            ("我们用钉钉", "high"),
+            ("请打开，手机", "high"),
+            ("我们三点到五点再开始写作业", "high"),
+            ("从两点到四点都是自习课", "high"),
+            ("从源节点到目的节点转发数据包", "high"),
+            ("这个节点到另一个节点的地址", "high"),
             ("大家先点到再开始上课", "high"),
             ("今天我们讲第二章第三节", None),
         )

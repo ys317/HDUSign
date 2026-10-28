@@ -293,6 +293,114 @@ class MultiAccountTests(unittest.TestCase):
         self.assertFalse(self.manager.requestClose())
         self.drain(lambda: not first._task and not second._task)
 
+    def test_recent_account_order_survives_restart_without_changing_login_default(self):
+        legacy_order = list(self.manager.controllers)
+        self.assertEqual([row['username'] for row in self.manager.accountRows], legacy_order)
+        default = self.manager.accounts.last
+        credentials = dict(self.manager.accounts.accounts)
+        with patch('hdusign.multi_account.time.time', return_value=time.time()):
+            self.manager.activate('student-1')
+            self.manager.activate('student-0')
+        expected = ['student-0', 'student-1'] + [name for name in legacy_order
+                                               if name not in ('student-0', 'student-1')]
+        self.assertEqual([row['username'] for row in self.manager.accountRows], expected)
+        self.assertIs(self.manager.active, self.manager.controllers['student-0'])
+        self.assertEqual(self.manager.accounts.accounts, credentials)
+        self.assertEqual(self.manager.accounts.last, default)
+        before = self.manager.accounts.path.read_bytes()
+        other = AccountManager(self.root, services_factory=IsolatedFakeServices, auto_load=False)
+        try:
+            self.assertEqual([row['username'] for row in other.accountRows], expected)
+            self.assertEqual(other.active.account_username, default)
+            for controller in other.controllers.values():
+                controller.tick()
+                controller.set_courses(demo_courses())
+            self.assertEqual(other.accounts.path.read_bytes(), before)
+            self.assertEqual([row['username'] for row in other.accountRows], expected)
+        finally:
+            other.shutdown()
+
+    def test_successful_booking_and_monitor_start_update_account_order(self):
+        first = self.select('student-0', future=True)
+        self.manager.activate('student-1')
+        first.toggleMonitor()
+        self.assertTrue(first._scheduled)
+        self.assertEqual(self.manager.accountRows[0]['username'], 'student-0')
+        second = self.select('student-1')
+        self.manager.activate('student-2')
+        self.assertTrue(second.start_monitor())
+        self.assertEqual([row['username'] for row in self.manager.accountRows[:2]],
+                         ['student-0', 'student-1'])
+        self.assertIs(self.manager.active, self.manager.controllers['student-2'])
+        self.assertTrue(first._scheduled)
+        self.assertEqual(second._task, 'monitor')
+
+    def test_reservations_rank_before_recent_accounts_and_cancel_releases_priority(self):
+        first = self.select('student-0', future=True)
+        first.toggleMonitor()
+        second = self.select('student-1', future=True)
+        second.toggleMonitor()
+        self.manager.activate('student-2')
+        self.assertEqual([row['username'] for row in self.manager.accountRows[:3]],
+                         ['student-1', 'student-0', 'student-2'])
+        self.manager.activate('student-0')
+        self.assertEqual([row['username'] for row in self.manager.accountRows[:3]],
+                         ['student-0', 'student-1', 'student-2'])
+        first.cancelSchedule()
+        self.assertEqual([row['username'] for row in self.manager.accountRows[:3]],
+                         ['student-1', 'student-0', 'student-2'])
+
+    def test_failed_booking_and_monitor_start_keep_recent_order(self):
+        first = self.select('student-0', future=True)
+        self.manager.activate('student-1')
+        before = self.manager.accounts.path.read_bytes()
+        with patch.object(first, 'save', return_value=False):
+            first.toggleMonitor()
+            self.assertFalse(first.start_monitor())
+        self.assertFalse(first._schedules)
+        self.assertEqual(self.manager.accountRows[0]['username'], 'student-1')
+        self.assertEqual(self.manager.accounts.path.read_bytes(), before)
+
+    def test_successful_login_updates_usage_and_unremembered_login_preserves_history(self):
+        first = self.select('student-0')
+        first.login(False)
+        self.manager.activate('student-1')
+        self.drain(lambda: bool(self.manager.accounts.last_used.get('student-0'))
+                   and not first._task)
+        self.assertEqual(self.manager.accountRows[0]['username'], 'student-0')
+        previous = dict(self.manager.accounts.last_used)
+        self.manager.activate('')
+        draft = self.manager.active
+        draft.setField('username', 'temporary-student')
+        draft.setField('password', 'fixture-password')
+        draft.setField('remember', False)
+        draft.login(False)
+        target = self.manager.active
+        self.drain(lambda: not target._task)
+        self.assertEqual(self.manager.accountRows[0]['username'], 'temporary-student')
+        vault = AccountStore(self.root)
+        self.assertNotIn('temporary-student', vault.accounts)
+        self.assertEqual(vault.last_used, previous)
+
+    def test_failed_login_and_background_refresh_do_not_update_usage(self):
+        first = self.select('student-0')
+        self.manager.activate('student-1')
+        before = dict(self.manager.accounts.last_used)
+        first.services.login = lambda *args: 1
+        first.login(False)
+        self.drain(lambda: not first._task)
+        self.assertEqual(self.manager.accounts.last_used, before)
+        self.assertEqual(self.manager.accountRows[0]['username'], 'student-1')
+
+    def test_usage_write_failure_keeps_selected_account_and_other_saved_credentials(self):
+        before = self.manager.accounts.path.read_bytes()
+        with patch.object(self.manager.accounts, 'remember_use', side_effect=PermissionError()):
+            self.manager.activate('student-0')
+        self.assertEqual(self.manager.active.account_username, 'student-0')
+        self.assertEqual(self.manager.accountRows[0]['username'], 'student-0')
+        self.assertIn('最近使用记录未保存', self.manager.active._state['feedback'])
+        self.assertEqual(self.manager.accounts.path.read_bytes(), before)
+
 
 class WorkerIsolationTests(unittest.TestCase):
     def test_stopping_one_real_worker_exits_and_cleans_its_process(self):

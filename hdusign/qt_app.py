@@ -8,7 +8,7 @@ from urllib.parse import unquote
 from PySide6.QtCore import QPointF, QRectF, QSize, QUrl, Qt, qInstallMessageHandler
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtQml import QQmlApplicationEngine
-from PySide6.QtQuick import QQuickImageProvider
+from PySide6.QtQuick import QQuickImageProvider, QQuickWindow
 from PySide6.QtQuickControls2 import QQuickStyle
 
 from hdusign.desktop_controller import Controller
@@ -122,6 +122,7 @@ class Icons(QQuickImageProvider):
 
 def create_engine(controller, app=None):
     app = app or QGuiApplication.instance()
+    QQuickWindow.setDefaultAlphaBuffer(True)
     # PySide6 wheels no longer ship the legacy bundled-font directory, while
     # Basic Controls still probes it during first initialization. Keep that
     # harmless deployment warning out of the application's diagnostics while
@@ -144,12 +145,15 @@ def create_engine(controller, app=None):
     mono = "Cascadia Mono"
     app.setFont(QFont(body, 10))
     engine = QQmlApplicationEngine()
+    from hdusign.appearance import Appearance
+    appearance = Appearance(controller.root, parent=engine)
     load_errors = []
     engine.warnings.connect(lambda errors: load_errors.extend(error.toString() for error in errors))
     engine.addImageProvider("icons", Icons())
     context = engine.rootContext()
     manager = controller if hasattr(controller, "active") else None
     context.setContextProperty("accountManager", manager)
+    context.setContextProperty("appearance", appearance)
     context.setContextProperty("appController", manager.active if manager else controller)
     if manager:
         manager.activeChanged.connect(lambda: context.setContextProperty("appController", manager.active))
@@ -169,6 +173,7 @@ def create_engine(controller, app=None):
     if not engine.rootObjects():
         raise RuntimeError("无法加载 HDUSign Qt Quick 界面：\n" + "\n".join(load_errors))
     window = engine.rootObjects()[0]
+    appearance.attach(window)
     controller.closeReady.connect(window.close)
     return engine, window
 
