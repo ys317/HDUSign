@@ -897,10 +897,7 @@ class Controller(QObject):
                         else:
                             # Do not change existing remembered accounts, but do
                             # not auto-fill a previous account on the next launch.
-                            from hdusign.accounts import write_json
-                            write_json(self.account_store.path,
-                                       {"accounts": self.account_store.accounts, "last": ""})
-                            self.account_store.last = ""
+                            self.account_store.clear_last()
                         disk = read_mapping(self.secrets_path)
                         for key in ("skl_username", "skl_password", "skl_password_dpapi"):
                             disk.pop(key, None)

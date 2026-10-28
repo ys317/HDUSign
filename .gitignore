@@ -4,6 +4,7 @@ session_local.json
 live_session.json
 live_profile/
 config.yaml
+appearance.json
 
 # 运行产物
 *.jsonl

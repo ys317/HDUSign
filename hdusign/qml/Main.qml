@@ -9,10 +9,14 @@ ApplicationWindow {
     visible: true
     width: 1180; height: 760
     minimumWidth: 960; minimumHeight: 600
+    flags: appearance.nativeSupported ? Qt.Window | Qt.FramelessWindowHint : Qt.Window
     // Keep the native title bar quiet; version and executable identity belong
     // in diagnostics/about information rather than the working surface.
     title: ""
-    color: Theme.canvas
+    color: appearance.active ? "transparent" : Theme.canvas
+    property bool glassDark: Theme.dark
+    onGlassDarkChanged: appearance.setDark(glassDark)
+    Component.onCompleted: appearance.setDark(glassDark)
     property bool collapsed: false
     property bool settingsVisible: false
     property bool activityExpanded: false
@@ -45,6 +49,69 @@ ApplicationWindow {
         function onNavigateCourses() { window.settingsVisible = false; window.collapsed = false; documentScroll.contentY = 0 }
     }
 
+    Rectangle {
+        id: glassTitleBar
+        z: 20
+        objectName: "glassTitleBar"
+        x: 0; y: 0; width: parent.width
+        height: appearance.nativeSupported ? 34 : 0
+        visible: height > 0
+        color: appearance.active ? Qt.rgba(1, 1, 1, 0.04) : Theme.sidebar
+        UiText { x: 16; anchors.verticalCenter: parent.verticalCenter; text: "HDUSign"; font.pixelSize: 12; color: Theme.muted }
+        MouseArea {
+            anchors.fill: parent; anchors.rightMargin: 128
+            onPressed: window.startSystemMove()
+            onDoubleClicked: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
+        }
+        Row {
+            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+            UiButton { objectName: "glassMinimize"; text: "−"; width: 42; height: 32; tooltip: "最小化"; onClicked: window.showMinimized() }
+            UiButton { objectName: "glassMaximize"; text: window.visibility === Window.Maximized ? "❐" : "□"; width: 42; height: 32; tooltip: "最大化 / 还原"; onClicked: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized() }
+            UiButton { objectName: "glassClose"; text: "×"; width: 42; height: 32; tooltip: "关闭"; danger: true; onClicked: window.close() }
+        }
+    }
+
+    Repeater {
+        model: [
+            {edges: Qt.LeftEdge, cursor: Qt.SizeHorCursor}, {edges: Qt.RightEdge, cursor: Qt.SizeHorCursor},
+            {edges: Qt.TopEdge, cursor: Qt.SizeVerCursor}, {edges: Qt.BottomEdge, cursor: Qt.SizeVerCursor},
+            {edges: Qt.LeftEdge | Qt.TopEdge, cursor: Qt.SizeFDiagCursor},
+            {edges: Qt.RightEdge | Qt.BottomEdge, cursor: Qt.SizeFDiagCursor},
+            {edges: Qt.RightEdge | Qt.TopEdge, cursor: Qt.SizeBDiagCursor},
+            {edges: Qt.LeftEdge | Qt.BottomEdge, cursor: Qt.SizeBDiagCursor}
+        ]
+        delegate: MouseArea {
+            required property var modelData
+            readonly property bool leftEdge: !!(modelData.edges & Qt.LeftEdge)
+            readonly property bool rightEdge: !!(modelData.edges & Qt.RightEdge)
+            readonly property bool topEdge: !!(modelData.edges & Qt.TopEdge)
+            readonly property bool bottomEdge: !!(modelData.edges & Qt.BottomEdge)
+            x: leftEdge ? 0 : rightEdge ? window.width - 6 : 6
+            y: topEdge ? 0 : bottomEdge ? window.height - 6 : 6
+            width: leftEdge || rightEdge ? 6 : window.width - 12
+            height: topEdge || bottomEdge ? 6 : window.height - 12
+            z: 100
+            enabled: appearance.nativeSupported && window.visibility !== Window.Maximized
+            cursorShape: modelData.cursor
+            onPressed: window.startSystemResize(modelData.edges)
+        }
+    }
+
+    Rectangle {
+        objectName: "desktopGlassTint"
+        z: -1
+        anchors.fill: parent
+        visible: appearance.active
+        color: Theme.dark ? Qt.rgba(0.045, 0.055, 0.075, 0.12 + (100 - appearance.values.transparency) * 0.0068)
+                          : Qt.rgba(0.98, 0.99, 1, 0.12 + (100 - appearance.values.transparency) * 0.0068)
+        Rectangle {
+            anchors.fill: parent
+            color: Theme.dark ? Qt.rgba(0.08, 0.14, 0.23, appearance.values.tint * 0.003)
+                              : Qt.rgba(0.68, 0.8, 0.96, appearance.values.tint * 0.003)
+        }
+        GlassFrame { anchors.fill: parent; cornerRadius: 0 }
+    }
+
     Popup {
         id: robotDialog
         objectName: "robotConflictDialog"
@@ -56,7 +123,11 @@ ApplicationWindow {
         width: Math.min(window.width - 60, 600)
         padding: 24; modal: true; focus: true
         closePolicy: Popup.NoAutoClose
-        background: Rectangle { radius: 6; color: Theme.surface; border.color: Theme.border; border.width: 1 }
+        background: Rectangle {
+            radius: appearance.active ? 14 : 6; color: Theme.surface
+            border.color: Theme.border; border.width: 1
+            GlassFrame { anchors.fill: parent; cornerRadius: parent.radius }
+        }
         Connections {
             target: accountManager
             function onRobotPromptChanged() {
@@ -99,8 +170,10 @@ ApplicationWindow {
     Rectangle {
         id: sidebar
         width: window.collapsed ? 56 : 240
-        anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.left: parent.left
-        color: Theme.sidebar
+        anchors.top: glassTitleBar.bottom; anchors.bottom: parent.bottom; anchors.left: parent.left
+        color: !appearance.active ? Theme.sidebar : Theme.dark ? Qt.rgba(0.06, 0.075, 0.1, 0.38)
+                                                               : Qt.rgba(0.95, 0.97, 1, 0.42)
+        GlassFrame { anchors.fill: parent; cornerRadius: 0 }
         Column {
             id: navigation
             x: 8; y: 6; width: parent.width - 16; spacing: 2
@@ -178,11 +251,19 @@ ApplicationWindow {
                     delegate: Item {
                         required property var modelData
                         width: ListView.view.width; height: 46
-                        Rectangle { anchors.fill: parent; radius: 4; color: modelData.active ? Theme.selected : "transparent" }
+                        Rectangle {
+                            objectName: "accountRowBackground_" + modelData.username
+                            anchors.fill: parent; radius: appearance.active ? 9 : 4
+                            color: modelData.scheduled ? (modelData.active ? Theme.reservedSelected : Theme.reserved)
+                                                      : modelData.active ? Theme.selected : "transparent"
+                            border.width: modelData.active ? 1 : 0
+                            border.color: Theme.accent
+                            GlassFrame { anchors.fill: parent; cornerRadius: parent.radius; visible: appearance.active && modelData.scheduled }
+                        }
                         Column {
                             x: 8; y: 5; width: parent.width - 42; spacing: 3
-                            UiText { width: parent.width; text: modelData.name + " · " + modelData.status; elide: Text.ElideRight; font.pixelSize: 12 }
-                            UiText { width: parent.width; text: modelData.course || modelData.username; elide: Text.ElideRight; color: Theme.muted; font.pixelSize: 11 }
+                            UiText { width: parent.width; text: modelData.name + " · " + modelData.status; elide: Text.ElideRight; font.pixelSize: 12; lineHeight: 1.05 }
+                            UiText { width: parent.width; text: modelData.course || modelData.username; elide: Text.ElideRight; color: Theme.muted; font.pixelSize: 11; lineHeight: 1.05 }
                         }
                         MouseArea { anchors.fill: parent; onClicked: accountManager.activate(modelData.username) }
                         UiButton {
@@ -282,7 +363,7 @@ ApplicationWindow {
     Item {
         id: main
         anchors.left: sidebar.right; anchors.leftMargin: 1
-        anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom
+        anchors.right: parent.right; anchors.top: glassTitleBar.bottom; anchors.bottom: parent.bottom
         Item {
             id: topbar
             height: 44; width: parent.width

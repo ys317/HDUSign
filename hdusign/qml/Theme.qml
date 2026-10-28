@@ -13,6 +13,8 @@ QtObject {
     readonly property color selected: dark ? "#303030" : "#eae9e7"
     readonly property color inset: dark ? "#272727" : "#f1f1ef"
     readonly property color surface: dark ? "#272727" : "#ffffff"
+    readonly property color reserved: dark ? "#b310151d" : "#b3d8e1ea"
+    readonly property color reservedSelected: dark ? "#d914202d" : "#d9c8d8e7"
     readonly property color red: dark ? "#f07878" : "#eb5757"
     readonly property color redFill: dark ? "#352727" : "#ffeceb"
     readonly property color redBorder: dark ? "#513434" : "#f4d5d5"

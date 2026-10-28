@@ -6,6 +6,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -102,6 +103,24 @@ class AccountStore:
                 or any(not isinstance(k, str) or not isinstance(v, str)
                        for k, v in self.accounts.items())):
             raise ValueError("已保存账号文件格式错误。")
+        usage = value.get("last_used", {})
+        self.last_used = {}
+        if isinstance(usage, dict):
+            self.last_used = {username: at for username, at in usage.items()
+                              if username in self.accounts and not isinstance(at, bool)
+                              and isinstance(at, (int, float)) and math.isfinite(at) and at > 0}
+
+    def remember_use(self, username, at):
+        if username not in self.accounts:
+            return
+        usage = dict(self.last_used)
+        usage[username] = at
+        write_json(self.path, {"accounts": self.accounts, "last": self.last, "last_used": usage})
+        self.last_used = usage
+
+    def clear_last(self):
+        write_json(self.path, {"accounts": self.accounts, "last": "", "last_used": self.last_used})
+        self.last = ""
 
     def password(self, username):
         return protect(self.accounts[username], True)
@@ -109,7 +128,7 @@ class AccountStore:
     def save(self, username, password):
         records = dict(self.accounts)
         records[username] = protect(password)
-        write_json(self.path, {"accounts": records, "last": username})
+        write_json(self.path, {"accounts": records, "last": username, "last_used": self.last_used})
         self.accounts, self.last = records, username
 
     def delete(self, username):
@@ -129,5 +148,6 @@ class AccountStore:
         records = dict(self.accounts)
         records.pop(username, None)
         last = "" if self.last == username else self.last
-        write_json(self.path, {"accounts": records, "last": last})
-        self.accounts, self.last = records, last
+        usage = {key: at for key, at in self.last_used.items() if key != username}
+        write_json(self.path, {"accounts": records, "last": last, "last_used": usage})
+        self.accounts, self.last, self.last_used = records, last, usage

@@ -5,7 +5,7 @@ import time
 import unittest
 
 import shiboken6
-from PySide6.QtCore import QObject, qInstallMessageHandler
+from PySide6.QtCore import QObject, QPointF, Qt, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtTest import QTest
 
@@ -45,7 +45,10 @@ class MultiQmlTests(unittest.TestCase):
                 self.assertIs(current, manager.active)
                 self.assertEqual(current._form['username'], 'student-b')
                 self.assertEqual(first._task, 'monitor')
-                self.assertIsNotNone(window.findChild(QObject, 'accountTaskList'))
+                account_list = window.findChild(QObject, 'accountTaskList')
+                self.assertIsNotNone(account_list)
+                rows = account_list.property('model')
+                self.assertEqual([row['username'] for row in rows], ['student-b', 'student-a'])
                 current.navigateSettings.emit('webhookName')
                 hook = manager.webhooks.remember_verified('测试群', 'https://example.invalid/fixture')
                 manager.assignWebhook(hook)
@@ -55,8 +58,14 @@ class MultiQmlTests(unittest.TestCase):
                 self.assertIsNotNone(box)
                 self.assertEqual(box.property('currentText'), '测试群')
                 self.assertEqual(current._form['webhookName'], '测试群')
-                manager.activate('student-a')
+                # The second visible row is now A. Clicking it must select A
+                # and move it above B without interrupting A's running task.
+                QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier,
+                                 account_list.mapToScene(QPointF(20, 61)).toPoint())
+                QTest.qWait(70)
                 self.assertIs(engine.rootContext().contextProperty('appController'), first)
+                rows = account_list.property('model')
+                self.assertEqual([row['username'] for row in rows], ['student-a', 'student-b'])
                 self.assertEqual(first._task, 'monitor')
                 manager.stopAll()
                 if first.worker:

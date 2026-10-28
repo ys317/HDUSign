@@ -34,7 +34,11 @@ def main(argv=None) -> int:
 
     parser.add_argument("--version", action="version", version=f"HDUSign v{__version__}")
     parser.add_argument("--check-runtime", metavar="REPORT", help=argparse.SUPPRESS)
+    parser.add_argument("--check-glass", metavar="REPORT", help=argparse.SUPPRESS)
     options = parser.parse_args(args)
+    if options.check_glass:
+        from hdusign.appearance_check import check_native_glass
+        return check_native_glass(options.check_glass)
     if options.check_runtime:
         from hdusign.runtime import check_runtime
 

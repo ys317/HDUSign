@@ -113,5 +113,57 @@ class EncryptionTests(unittest.TestCase):
                 self.assertNotIn('skl_username', load_credentials(second))
 
 
+class AccountUsageTests(unittest.TestCase):
+    def test_legacy_vault_keeps_order_and_usage_preserves_encrypted_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = {'older': protect('fixture-one'), 'newer': protect('fixture-two')}
+            path = root / 'accounts.json'
+            path.write_text(json.dumps({'accounts': records, 'last': 'newer'}), 'utf-8')
+            store = AccountStore(root)
+            self.assertEqual(store.last_used, {})
+            store.remember_use('older', 100)
+            reloaded = AccountStore(root)
+            self.assertEqual(list(reloaded.accounts), ['older', 'newer'])
+            self.assertEqual(reloaded.accounts, records)
+            self.assertEqual(reloaded.last, 'newer')
+            self.assertEqual(reloaded.last_used, {'older': 100})
+            store.save('newer', 'fixture-updated')
+            store.clear_last()
+            self.assertEqual(AccountStore(root).last_used, {'older': 100})
+            self.assertEqual(AccountStore(root).last, '')
+            store.delete('older')
+            self.assertEqual(AccountStore(root).last_used, {})
+            self.assertEqual(AccountStore(root).password('newer'), 'fixture-updated')
+
+    def test_invalid_usage_metadata_does_not_block_saved_accounts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = AccountStore(root)
+            for name in ('valid', 'boolean', 'text', 'negative', 'infinite'):
+                store.save(name, 'fixture-password')
+            value = json.loads(store.path.read_text('utf-8'))
+            value['last_used'] = {'valid': 100, 'boolean': True, 'text': '200',
+                                  'negative': -1, 'infinite': float('inf'), 'deleted': 300}
+            store.path.write_text(json.dumps(value), 'utf-8')
+            self.assertEqual(AccountStore(root).last_used, {'valid': 100})
+            value['last_used'] = []
+            store.path.write_text(json.dumps(value), 'utf-8')
+            self.assertEqual(AccountStore(root).last_used, {})
+
+    def test_unsaved_account_and_failed_write_do_not_change_vault(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = AccountStore(Path(temporary))
+            store.save('saved', 'fixture-password')
+            before = store.path.read_bytes()
+            store.remember_use('temporary', 100)
+            self.assertEqual(store.path.read_bytes(), before)
+            with patch('hdusign.accounts.write_json', side_effect=PermissionError()):
+                with self.assertRaises(PermissionError):
+                    store.remember_use('saved', 200)
+            self.assertEqual(store.last_used, {})
+            self.assertEqual(store.path.read_bytes(), before)
+
+
 if __name__ == '__main__':
     unittest.main()

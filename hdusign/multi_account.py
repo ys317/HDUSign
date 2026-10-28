@@ -222,6 +222,8 @@ class ManagedController(Controller):
             self._running_webhook, self._notification_route = None, None
             self._running_course = self._robot_started_at = None
             self._publish(runningRobotName="", runningRobotPending=False)
+        else:
+            self.manager.mark_used(self)
         self.manager.robots_changed()
         return started
 
@@ -268,6 +270,8 @@ class ManagedController(Controller):
             except (OSError, ValueError):
                 failed, result = True, 1
         super()._finish(kind, failed, result)
+        if kind == "login" and not failed and result == 0:
+            self.manager.mark_used(self)
         if kind == "monitor":
             if self._notification_route:
                 try:
@@ -307,6 +311,7 @@ class AccountManager(QObject):
         super().__init__(parent)
         self.root = Path(root) if root else application_root()
         self.accounts = AccountStore(self.root)
+        self._recent_use = dict(self.accounts.last_used)
         self.controllers = {}
         self._robots_ready = False
         self._robot_requests = []
@@ -323,7 +328,7 @@ class AccountManager(QObject):
         for username in list(self.accounts.accounts):
             self._controller(username)
         initial = self.accounts.last if self.accounts.last in self.controllers else ""
-        self.activate(initial)
+        self._activate(initial)
         self._robots_ready = True
         self.reconcile_robots()
 
@@ -409,7 +414,8 @@ class AccountManager(QObject):
                              next_course.title if next_course else controller._state["courseTitle"]),
                          "active": controller is self.active,
                          "monitoring": controller._task == "monitor", "scheduled": bool(controller._scheduled)})
-        return rows
+        return sorted(rows, key=lambda row: (row["scheduled"], self._recent_use.get(row["username"], 0)),
+                      reverse=True)
 
     @Property("QVariantList", notify=changed)
     def webhookChoices(self):
@@ -542,7 +548,10 @@ class AccountManager(QObject):
         if self.closing or controller._state["closing"]:
             return False
         if action == "book":
-            return Controller._reserve_course(controller, course, value)
+            reserved = Controller._reserve_course(controller, course, value)
+            if reserved:
+                self.mark_used(controller)
+            return reserved
         if action == "start":
             controller._launch_webhook = value
             result = controller.start_monitor(course)
@@ -675,12 +684,31 @@ class AccountManager(QObject):
 
     @Slot(str)
     def activate(self, username):
+        self._activate(username, record_use=True)
+
+    def mark_used(self, controller):
+        username = controller.account_username
+        if not username:
+            return
+        # Keep successive user actions ordered even with equal timestamps or a
+        # clock adjustment. Unsaved accounts only keep their order in memory.
+        at = max(time.time(), max(self._recent_use.values(), default=0) + 0.000001)
+        self._recent_use[username] = at
+        try:
+            self.accounts.remember_use(username, at)
+        except (OSError, ValueError):
+            controller._feedback("账号排序已更新，但最近使用记录未保存，重启后可能恢复原顺序。", True)
+        self.changed.emit()
+
+    def _activate(self, username, *, record_use=False):
         if self.closing:
             return
         self.active = self._controller(username)
         if not username and not self.active._task:
             Controller.setField(self.active, "username", "")
             Controller.setField(self.active, "password", "")
+        if record_use:
+            self.mark_used(self.active)
         self.activeChanged.emit()
         self.changed.emit()
 
@@ -695,7 +723,7 @@ class AccountManager(QObject):
                     target._form[key] = value
             target._form["username"] = username
             target.formChanged.emit()
-        self.activate(username)
+        self._activate(username)
         return target
 
     @Slot(str)
@@ -761,6 +789,7 @@ class AccountManager(QObject):
             remove_profile(self.root, directory.relative_to(self.root))
             self.accounts.delete(username)
             self.controllers.pop(username, None)
+            self._recent_use.pop(username, None)
             self.robots_changed()
             if controller is self.active:
                 self.activate("")
