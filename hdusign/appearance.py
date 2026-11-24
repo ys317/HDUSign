@@ -1,8 +1,6 @@
 """Small global appearance settings and Windows' own desktop acrylic material."""
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
 import math
 from pathlib import Path
 import sys
@@ -27,6 +25,8 @@ class WindowsBackdrop:
     def apply(self, window, enabled, dark):
         if not self.supported():
             return False
+        import ctypes
+        from ctypes import wintypes
         try:
             dwm = ctypes.WinDLL("dwmapi")
             dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,

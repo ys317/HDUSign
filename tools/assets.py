@@ -78,8 +78,10 @@ def generate_icon():
         draw.rounded_rectangle(
             (x, 128 - height / 2, x + 20, 128 + height / 2),
             radius=8, fill="#ffffff")
-    image.save(Path(__file__).resolve().parents[1] / "assets" / "hdusign.ico",
+    assets_dir = Path(__file__).resolve().parents[1] / "assets"
+    image.save(assets_dir / "hdusign.ico",
                sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    image.save(assets_dir / "hdusign.png")
 
 
 def main():

@@ -1,6 +1,7 @@
 """Real Chromium against intercepted fixtures only; all network is blocked."""
 from contextlib import redirect_stdout
 from io import StringIO
+import json
 from pathlib import Path
 import unittest
 import tempfile
@@ -52,6 +53,74 @@ class ChromiumVerificationTests(unittest.TestCase):
             raise unittest.SkipTest("Local Playwright Chromium is not installed")
         cls.chromium = cls.playwright.chromium.launch(headless=True)
         cls.addClassCleanup(cls.chromium.close)
+
+    def test_preparation_waits_for_sso_and_fills_password_that_appears_after_username(self):
+        context = self.chromium.new_context(service_workers="block")
+        self.addCleanup(context.close)
+        page = context.new_page()
+        login_url = "https://sso.hdu.edu.cn/login"
+        home_url = browser.START + "?logged-in=1"
+
+        def fixture(route):
+            url = route.request.url
+            if url == browser.START:
+                html = f"""<script>
+                localStorage.setItem('sessionId', 'expired-token');
+                setTimeout(() => location.href = '{login_url}', 150);
+                </script>"""
+            elif url == login_url:
+                html = f"""<input name="username">
+                <input type="password" hidden>
+                <button class="login-button disabled" disabled>登录</button>
+                <script>
+                const user = document.querySelector('[name=username]');
+                const button = document.querySelector('button');
+                user.addEventListener('input', () => setTimeout(() => {{
+                    const password = document.createElement('input');
+                    password.type = 'password';
+                    document.body.append(password);
+                    password.addEventListener('input', () => {{
+                        if (user.value === 'fixture-user' && password.value === 'fixture-password') {{
+                            button.disabled = false;
+                            button.classList.remove('disabled');
+                        }}
+                    }});
+                }}, 150), {{once:true}});
+                button.onclick = () => location.href = '{home_url}';
+                </script>"""
+            elif url == home_url:
+                html = """<a href="#/sign/in">课堂签到</a>
+                <div hidden id="keypad"><button>0</button><button disabled>签到</button></div>
+                <script>
+                localStorage.setItem('sessionId', 'fresh-token');
+                window.onhashchange = () => document.getElementById('keypad').hidden = false;
+                </script>"""
+            else:
+                route.abort()
+                return
+            route.fulfill(content_type="text/html; charset=utf-8", body=html)
+
+        context.route("**/*", fixture)
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()):
+            folder = Path(temp)
+            (folder / "stop.json").touch()
+            browser.serve_prepared(context, page, {
+                "skl_username": "fixture-user", "skl_password": "fixture-password",
+            }, folder)
+            self.assertEqual(json.loads((folder / "ready.json").read_text("utf-8"))["status"], "ready")
+        self.assertEqual(page.url, home_url + "#/sign/in")
+        self.assertTrue(browser.prepared_page_ready(page))
+
+    def test_saved_token_without_sign_in_entry_does_not_confirm_login(self):
+        context = self.chromium.new_context(service_workers="block")
+        self.addCleanup(context.close)
+        context.route("**/*", lambda route: route.fulfill(
+            content_type="text/html",
+            body="<script>localStorage.setItem('sessionId', 'expired-token')</script>",
+        ))
+        page = context.new_page()
+        with self.assertRaisesRegex(browser.SignPreparationError, "未加载「课堂签到」入口"):
+            browser.ensure_logged_in(page, {}, timeout_s=0.5)
 
     def test_input_observer_distinguishes_our_click_and_manual_takeover(self):
         context = self.chromium.new_context(service_workers="block")

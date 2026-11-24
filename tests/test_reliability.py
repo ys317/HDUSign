@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SignResultTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows browser command-line parsing")
     def test_profile_cleanup_matches_only_the_exact_user_data_dir(self):
         profile = Path("D:/EchoSign/browser_profile/accounts/account-a")
         self.assertTrue(browser._commandline_uses_profile(

@@ -1,4 +1,4 @@
-# Windows runtime dependencies (Python 3.13).
+# Runtime dependencies (Python 3.13).
 PySide6==6.11.2
 pillow==12.2.0
 PyYAML==6.0.3

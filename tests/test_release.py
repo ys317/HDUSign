@@ -1,7 +1,10 @@
 """Release retries must preserve an existing draft and confirmed uploaded bytes."""
 from pathlib import Path
+import hashlib
+import io
 import json
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -47,15 +50,62 @@ class ReleaseTests(unittest.TestCase):
             with zipfile.ZipFile(bundle, "w") as package:
                 package.writestr("ffmpeg/SOURCE.json", json.dumps(metadata))
             source.write_bytes(b"different source")
-            with patch("release.subprocess.run") as run:
+            with patch("release.sys.platform", "win32"), patch("release.subprocess.run") as run:
                 with self.assertRaisesRegex(RuntimeError, "source archive is missing or changed"):
                     prepare_ffmpeg(bundle)
                 run.assert_not_called()
             source.unlink()
-            with patch("release.subprocess.run") as run:
+            with patch("release.sys.platform", "win32"), patch("release.subprocess.run") as run:
                 with self.assertRaisesRegex(RuntimeError, "source archive is missing or changed"):
                     prepare_ffmpeg(bundle)
                 run.assert_not_called()
+
+    def test_linux_tar_ffmpeg_bundle_validates_source_and_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "ffmpeg-linux64.tar.gz"
+            source = root / "ffmpeg-8.1.2-hdusign-audio-linux64-source.tar.xz"
+            source.write_bytes(b"linux corresponding source")
+            fake_bin = b"fake-linux-ffmpeg-binary"
+            bin_hash = hashlib.sha256(fake_bin).hexdigest()
+            metadata = {
+                "component": "FFmpeg", "version": "8.1.2-hdusign-audio",
+                "license": "LGPL-2.1-or-later", "tls_backend": "gnutls",
+                "corresponding_source_included": True, "binary_sha256": bin_hash,
+                "source_archive": {"name": source.name, "sha256": sha256(source)},
+            }
+            files = {
+                "ffmpeg/SOURCE.json": json.dumps(metadata).encode("utf-8"),
+                "ffmpeg/ffmpeg": fake_bin,
+                "ffmpeg/LICENSE": b"LGPL",
+                "ffmpeg/README.txt": b"readme",
+                "ffmpeg/version.txt": b"ffmpeg version 8.1.2-hdusign-audio Copyright",
+                "ffmpeg/buildconf.txt": b"--enable-gnutls --disable-autodetect",
+                "ffmpeg/license-notice.txt": b"GNU Lesser General Public License",
+                "ffmpeg/licenses/toolchain/libc6/copyright": b"glibc copyright",
+            }
+            with tarfile.open(bundle, "w:gz") as package:
+                for name, data in files.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    package.addfile(info, io.BytesIO(data))
+            responses = [
+                MagicMock(stdout=files["ffmpeg/version.txt"].decode(), stderr=""),
+                MagicMock(stdout=files["ffmpeg/buildconf.txt"].decode(), stderr=""),
+                MagicMock(stdout=files["ffmpeg/license-notice.txt"].decode(), stderr=""),
+            ]
+            with patch("release.sys.platform", "linux"), \
+                    patch("release.FFMPEG_BINARY", "ffmpeg"), \
+                    patch("release.FFMPEG_FILES", ("ffmpeg", "LICENSE", "README.txt", "SOURCE.json",
+                                                   "version.txt", "buildconf.txt", "license-notice.txt")), \
+                    patch("release.RUNTIME", root / "runtime"), \
+                    patch("release.BUILD", root), \
+                    patch("release.OUTPUT", root / "output"), \
+                    patch("release.subprocess.run", side_effect=responses), \
+                    patch("release.check_ffmpeg_runtime", return_value={"version": "8.1.2-hdusign-audio"}):
+                result = prepare_ffmpeg(bundle)
+            self.assertEqual(result["tls_backend"], "gnutls")
+            self.assertTrue((root / "output" / source.name).is_file())
 
     def test_retry_finds_draft_without_a_published_tag_lookup(self):
         draft = {"id": 1, "tag_name": "v1.4", "draft": True}

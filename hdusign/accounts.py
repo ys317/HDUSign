@@ -1,20 +1,27 @@
-"""Local account vault using Windows DPAPI, scoped to the current Windows user."""
+"""Local account vault using Windows DPAPI or user-scoped POSIX vault keys."""
 from __future__ import annotations
 
 import base64
-import ctypes
-from ctypes import wintypes
 import hashlib
+import hmac
 import json
 import math
 import os
 from pathlib import Path
+import secrets
 import shutil
+import struct
+import sys
 
 SESSION_ENV = "HDUSIGN_SESSION_CREDENTIALS"
+_POSIX_PREFIX = "v1:"
+_POSIX_ERROR = "无法读取或加密密码，请在原 Linux 用户下运行或重新输入密码。"
 
 
-def protect(text, decrypt=False):
+def _protect_win32(text, decrypt=False):
+    import ctypes
+    from ctypes import wintypes
+
     class Blob(ctypes.Structure):
         _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
     raw = base64.b64decode(text, validate=True) if decrypt else text.encode("utf-8")
@@ -36,6 +43,123 @@ def protect(text, decrypt=False):
         return result.decode("utf-8") if decrypt else base64.b64encode(result).decode("ascii")
     finally:
         kernel.LocalFree(target.data)
+
+
+def _posix_vault_key_path() -> Path:
+    override = os.environ.get("HDUSIGN_VAULT_KEY_PATH", "").strip()
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    config_root = Path(base) if base else (Path.home() / ".config")
+    return config_root / "HDUSign" / "vault.key"
+
+
+def _read_posix_key(path: Path) -> bytes:
+    if path.is_symlink():
+        raise OSError(_POSIX_ERROR)
+    key = path.read_bytes()
+    if len(key) != 32:
+        raise OSError(_POSIX_ERROR)
+    return key
+
+
+def _posix_vault_key(create: bool) -> bytes:
+    path = _posix_vault_key_path()
+    if path.is_symlink():
+        raise OSError(_POSIX_ERROR)
+    if path.is_file():
+        return _read_posix_key(path)
+    if not create:
+        raise OSError(_POSIX_ERROR)
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
+    key = secrets.token_bytes(32)
+    tmp = parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        try:
+            os.write(fd, key)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path)
+            return key
+        except FileExistsError:
+            return _read_posix_key(path)
+        except OSError:
+            try:
+                direct_fd = os.open(path, flags, 0o600)
+            except FileExistsError:
+                return _read_posix_key(path)
+            try:
+                os.write(direct_fd, key)
+                os.fsync(direct_fd)
+            finally:
+                os.close(direct_fd)
+            return key
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _xor_keystream(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
+    if not data:
+        return b""
+    out = bytearray(len(data))
+    offset = 0
+    counter = 0
+    while offset < len(data):
+        block = hmac.new(enc_key, nonce + struct.pack(">I", counter), hashlib.sha256).digest()
+        take = min(len(block), len(data) - offset)
+        for index in range(take):
+            out[offset + index] = data[offset + index] ^ block[index]
+        offset += take
+        counter += 1
+    return bytes(out)
+
+
+def _protect_posix(text, decrypt=False):
+    master = _posix_vault_key(create=not decrypt)
+    enc_key = hmac.new(master, b"hdusign-vault-v1-enc", hashlib.sha256).digest()
+    mac_key = hmac.new(master, b"hdusign-vault-v1-mac", hashlib.sha256).digest()
+    if decrypt:
+        if not isinstance(text, str) or not text.startswith(_POSIX_PREFIX):
+            raise OSError(_POSIX_ERROR)
+        try:
+            blob = base64.b64decode(text[len(_POSIX_PREFIX):], validate=True)
+        except ValueError as exc:
+            raise OSError(_POSIX_ERROR) from exc
+        if len(blob) < 48:
+            raise OSError(_POSIX_ERROR)
+        nonce, ciphertext, tag = blob[:16], blob[16:-32], blob[-32:]
+        expected = hmac.new(mac_key, b"hdusign-vault-v1" + nonce + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected):
+            raise OSError(_POSIX_ERROR)
+        plaintext = _xor_keystream(enc_key, nonce, ciphertext)
+        try:
+            return plaintext.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OSError(_POSIX_ERROR) from exc
+    plaintext = text.encode("utf-8")
+    nonce = secrets.token_bytes(16)
+    ciphertext = _xor_keystream(enc_key, nonce, plaintext)
+    tag = hmac.new(mac_key, b"hdusign-vault-v1" + nonce + ciphertext, hashlib.sha256).digest()
+    return _POSIX_PREFIX + base64.b64encode(nonce + ciphertext + tag).decode("ascii")
+
+
+def protect(text, decrypt=False):
+    if sys.platform == "win32":
+        return _protect_win32(text, decrypt)
+    return _protect_posix(text, decrypt)
 
 
 def read_json(path):
@@ -71,6 +195,11 @@ def load_credentials(root, use_session=True):
     return data
 
 
+def _is_junction(path: Path) -> bool:
+    checker = getattr(path, "is_junction", None)
+    return bool(checker()) if checker is not None else False
+
+
 def remove_profile(root, relative):
     root = Path(root).resolve()
     target = root / relative
@@ -82,12 +211,12 @@ def remove_profile(root, relative):
     for parent in (target, *target.parents):
         if parent == root:
             break
-        if parent.is_symlink() or parent.is_junction():
+        if parent.is_symlink() or _is_junction(parent):
             raise OSError("浏览器目录包含链接，未删除。")
     for directory, directories, _ in os.walk(target, followlinks=False):
         for name in directories:
             child = Path(directory) / name
-            if child.is_symlink() or child.is_junction():
+            if child.is_symlink() or _is_junction(child):
                 raise OSError("浏览器目录包含链接，未删除。")
     shutil.rmtree(target)
 

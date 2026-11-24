@@ -18,7 +18,7 @@ import numpy as np
 
 from hdusign.audio import SAMPLE_RATE
 from hdusign.processes import hidden_subprocess_options
-from hdusign.runtime import resource_root
+from hdusign.runtime import FFMPEG_BINARY, resource_root
 
 
 # Absorb a network catch-up burst or a slow recognizer without losing audio.
@@ -36,7 +36,7 @@ _HTTP_AUTH_ERROR = re.compile(rb"\b(?:http error|server returned|http/[12](?:\.[
 _TLS_ERRORS = (b"certificate verify failed", b"certificate verification failed",
                b"certificate verification error", b"peer certificate cannot be authenticated",
                b"certificate is not trusted", b"certificate is not yet activated",
-               b"certificate has expired", b"certificate revoked",
+               b"certificate has expired", b"certificate revoked", b"certificate has been revoked",
                b"certificate's owner does not match", b"certificate does not match",
                b"sni or certificate check failed",
                # Schannel reports Windows certificate/identity failures as HRESULTs.
@@ -60,7 +60,7 @@ class MediaError(RuntimeError):
 
 def find_ffmpeg() -> str:
     """Portable packages never depend on a separately installed FFmpeg."""
-    bundled = resource_root() / "ffmpeg" / "ffmpeg.exe"
+    bundled = resource_root() / "ffmpeg" / FFMPEG_BINARY
     if bundled.is_file():
         return str(bundled)
     if getattr(sys, "frozen", False):

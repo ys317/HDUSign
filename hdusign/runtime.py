@@ -12,7 +12,8 @@ SEMANTIC_FILES = ("model_optimized.onnx", "config.json", "tokenizer.json",
                   "tokenizer_config.json", "special_tokens_map.json")
 ASR_FOLDER = "sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30"
 ASR_FILES = ("encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt")
-FFMPEG_FILES = ("ffmpeg.exe", "LICENSE", "README.txt", "SOURCE.json", "version.txt",
+FFMPEG_BINARY = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+FFMPEG_FILES = (FFMPEG_BINARY, "LICENSE", "README.txt", "SOURCE.json", "version.txt",
                 "buildconf.txt", "license-notice.txt")
 
 # Keep the handles alive for the lifetime of the process.  Qt's Windows DLLs

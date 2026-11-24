@@ -1,11 +1,12 @@
-"""Build and publish a verified, self-contained Windows release.
+"""Build and publish a verified, self-contained Windows or Linux release.
 
-Usage: python tools/release.py build --ffmpeg-bundle <verified-audio-build.zip>
+Usage: python tools/release.py build --ffmpeg-bundle <verified-audio-build>
        python tools/release.py publish --notes <release-notes.md>
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import importlib.metadata
 import io
@@ -17,6 +18,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import zipfile
@@ -29,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from hdusign import __version__
 from hdusign.processes import hidden_subprocess_options
-from hdusign.runtime import (ASR_FILES, ASR_FOLDER, FFMPEG_FILES, SEMANTIC_FILES,
+from hdusign.runtime import (ASR_FILES, ASR_FOLDER, FFMPEG_BINARY, FFMPEG_FILES, SEMANTIC_FILES,
                               SEMANTIC_FOLDER, SEMANTIC_MODEL, check_ffmpeg_runtime)
 
 BUILD = ROOT / "build"
@@ -37,6 +39,27 @@ RUNTIME = BUILD / "portable-runtime"
 VERSION = f"v{__version__}"
 DIST = BUILD / "releases" / VERSION
 OUTPUT = ROOT / "dist" / "releases" / VERSION
+
+
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _platform_tag() -> str:
+    return "linux-x64" if _is_linux() else "win64"
+
+
+def _archive_name() -> str:
+    return f"HDUSign-{VERSION}-{_platform_tag()}.{'tar.gz' if _is_linux() else 'zip'}"
+
+
+def _checksums_name() -> str:
+    return "SHA256SUMS-linux-x64.txt" if _is_linux() else "SHA256SUMS.txt"
+
+
+def _manifest_path() -> Path:
+    return BUILD / (f"release-{VERSION}-linux-x64-manifest.json" if _is_linux()
+                    else f"release-{VERSION}-manifest.json")
 
 
 def sha256(path: Path) -> str:
@@ -67,42 +90,64 @@ def copy_files(source: Path, destination: Path, names) -> None:
         shutil.copy2(source / name, destination / name)
 
 
+def _read_bundle_entries(bundle: Path) -> dict[str, bytes]:
+    if zipfile.is_zipfile(bundle):
+        with zipfile.ZipFile(bundle) as package:
+            return {entry.filename: package.read(entry)
+                    for entry in package.infolist() if not entry.is_dir()}
+    with tarfile.open(bundle, "r:*") as package:
+        entries = {}
+        for member in package.getmembers():
+            if member.isfile():
+                extracted = package.extractfile(member)
+                if extracted is not None:
+                    entries[member.name.lstrip("./")] = extracted.read()
+        return entries
+
+
 def prepare_ffmpeg(bundle: Path) -> dict:
     """Bundle our minimal decoder only with its matching complete source archive."""
     bundle = bundle.resolve()
     if not bundle.is_file():
         raise RuntimeError("The verified FFmpeg bundle is missing; build the audio component first.")
-    with zipfile.ZipFile(bundle) as package:
-        metadata = json.loads(package.read("ffmpeg/SOURCE.json"))
-        if (metadata.get("component") != "FFmpeg"
-                or metadata.get("license") != "LGPL-2.1-or-later"
-                or metadata.get("tls_backend") != "schannel"
-                or metadata.get("corresponding_source_included") is not True):
-            raise RuntimeError("Use the HDUSign FFmpeg audio build with its complete matching source.")
-        source = metadata.get("source_archive") or {}
-        name = source.get("name", "")
-        if not name or Path(name).name != name or not name.endswith("-source.tar.xz"):
-            raise RuntimeError("The FFmpeg source archive name is invalid.")
-        source_archive = bundle.parent / name
-        if not source_archive.is_file() or sha256(source_archive) != source.get("sha256"):
-            raise RuntimeError("The complete matching FFmpeg source archive is missing or changed.")
-        destination = RUNTIME / "ffmpeg"
-        clear_generated(destination)
-        destination.mkdir(parents=True)
-        for filename in FFMPEG_FILES:
-            (destination / filename).write_bytes(package.read("ffmpeg/" + filename))
-        # Keep the MinGW/GCC runtime notices shipped by the verified build.
-        notices = [entry for entry in package.infolist()
-                   if entry.filename.startswith("ffmpeg/licenses/") and not entry.is_dir()]
-        if not notices:
-            raise RuntimeError("The audio build's toolchain license notices are missing.")
-        for entry in notices:
-            target = (destination / entry.filename.removeprefix("ffmpeg/")).resolve()
-            if not target.is_relative_to((destination / "licenses").resolve()):
-                raise RuntimeError("The audio build contains an invalid license path.")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(package.read(entry))
-    executable = destination / "ffmpeg.exe"
+    entries = _read_bundle_entries(bundle)
+    if "ffmpeg/SOURCE.json" not in entries:
+        raise RuntimeError("The verified FFmpeg bundle is missing SOURCE.json.")
+    metadata = json.loads(entries["ffmpeg/SOURCE.json"])
+    expected_tls = "gnutls" if _is_linux() else "schannel"
+    if (metadata.get("component") != "FFmpeg"
+            or metadata.get("license") != "LGPL-2.1-or-later"
+            or metadata.get("tls_backend") != expected_tls
+            or metadata.get("corresponding_source_included") is not True):
+        raise RuntimeError("Use the HDUSign FFmpeg audio build with its complete matching source.")
+    source = metadata.get("source_archive") or {}
+    name = source.get("name", "")
+    if not name or Path(name).name != name or not name.endswith("-source.tar.xz"):
+        raise RuntimeError("The FFmpeg source archive name is invalid.")
+    source_archive = bundle.parent / name
+    if not source_archive.is_file() or sha256(source_archive) != source.get("sha256"):
+        raise RuntimeError("The complete matching FFmpeg source archive is missing or changed.")
+    destination = RUNTIME / "ffmpeg"
+    clear_generated(destination)
+    destination.mkdir(parents=True)
+    for filename in FFMPEG_FILES:
+        key = "ffmpeg/" + filename
+        if key not in entries:
+            raise RuntimeError(f"The audio build is missing required file: {filename}")
+        (destination / filename).write_bytes(entries[key])
+    # Keep the compiler/runtime notices shipped by the verified build.
+    notices = [filename for filename in entries if filename.startswith("ffmpeg/licenses/")]
+    if not notices:
+        raise RuntimeError("The audio build's toolchain license notices are missing.")
+    for filename in notices:
+        target = (destination / filename.removeprefix("ffmpeg/")).resolve()
+        if not target.is_relative_to((destination / "licenses").resolve()):
+            raise RuntimeError("The audio build contains an invalid license path.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(entries[filename])
+    executable = destination / FFMPEG_BINARY
+    if _is_linux():
+        executable.chmod(0o755)
     if sha256(executable) != metadata.get("binary_sha256"):
         raise RuntimeError("The FFmpeg binary does not match its build provenance.")
 
@@ -117,7 +162,7 @@ def prepare_ffmpeg(bundle: Path) -> dict:
     buildconf = inspect("-buildconf")
     license_notice = inspect("-L")
     if (not version_text.startswith(f"ffmpeg version {metadata['version']} ")
-            or "--enable-schannel" not in buildconf or "--disable-autodetect" not in buildconf
+            or f"--enable-{expected_tls}" not in buildconf or "--disable-autodetect" not in buildconf
             or "--enable-gpl" in buildconf or "--enable-nonfree" in buildconf
             or "--enable-version3" in buildconf
             or "GNU Lesser General Public" not in license_notice):
@@ -139,8 +184,8 @@ def prepare_browsers() -> None:
 
     package = Path(playwright.__file__).resolve().parent / "driver" / "package"
     registry = json.loads((package / "browsers.json").read_text(encoding="utf-8"))
-    components = [entry for entry in registry["browsers"]
-                  if entry["name"] in {"chromium", "ffmpeg", "winldd"}]
+    wanted = {"chromium", "ffmpeg"} if _is_linux() else {"chromium", "ffmpeg", "winldd"}
+    components = [entry for entry in registry["browsers"] if entry["name"] in wanted]
     browsers = RUNTIME / "browsers"
     clear_generated(browsers)
     browsers.mkdir(parents=True)
@@ -150,7 +195,7 @@ def prepare_browsers() -> None:
     for component in components:
         name = f"{component['name']}-{component['revision']}"
         if (cache / name).is_dir():
-            shutil.copytree(cache / name, browsers / name)
+            shutil.copytree(cache / name, browsers / name, symlinks=True)
     if any(not (browsers / f"{c['name']}-{c['revision']}").is_dir() for c in components):
         env = dict(os.environ, PLAYWRIGHT_BROWSERS_PATH=str(browsers))
         subprocess.run([sys.executable, "-m", "playwright", "install", "--no-shell", "chromium"],
@@ -164,7 +209,14 @@ def prepare_browsers() -> None:
             else:
                 extra.unlink()
     chromium = next(c for c in components if c["name"] == "chromium")
-    require_files(browsers / f"chromium-{chromium['revision']}" / "chrome-win64", ["chrome.exe"])
+    chromium_dir = browsers / f"chromium-{chromium['revision']}"
+    if _is_linux():
+        candidates = (chromium_dir / "chrome-linux" / "chrome",
+                      chromium_dir / "chrome-linux64" / "chrome")
+        if not any(path.is_file() for path in candidates):
+            raise RuntimeError(f"Missing Linux Chromium binary under {chromium_dir}")
+    else:
+        require_files(chromium_dir / "chrome-win64", ["chrome.exe"])
     print(f"Bundled Chromium {chromium['browserVersion']}", flush=True)
 
 
@@ -220,44 +272,78 @@ def copy_dependency_licenses(destination: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
     python_root = Path(sys._base_executable).resolve().parent
-    for name in ("LICENSE.txt", "LICENSE"):
-        if (python_root / name).is_file():
-            shutil.copy2(python_root / name, destination / "Python-LICENSE.txt")
-            break
+    for directory in (python_root, python_root.parent, Path(sys.base_prefix)):
+        for name in ("LICENSE.txt", "LICENSE"):
+            if (directory / name).is_file():
+                shutil.copy2(directory / name, destination / "Python-LICENSE.txt")
+                return
 
 
 def verify_archive(archive: Path) -> dict:
-    """Exercise the extracted exe with empty caches, a minimal PATH and no downloads."""
-    with tempfile.TemporaryDirectory(prefix="解压 验证 ", dir=BUILD) as temporary:
-        workspace = Path(temporary)
-        with zipfile.ZipFile(archive) as package:
-            if bad := package.testzip():
-                raise RuntimeError(f"ZIP checksum failed: {bad}")
-            package.extractall(workspace)
+    """Exercise the extracted app with empty caches, a minimal PATH and no downloads."""
+    with ExitStack() as stack:
+        workspace = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="解压 验证 ", dir=BUILD)))
+        if archive.name.endswith(".tar.gz"):
+            with tarfile.open(archive, "r:gz") as package:
+                package.extractall(workspace, filter="tar")
+        else:
+            with zipfile.ZipFile(archive) as package:
+                if bad := package.testzip():
+                    raise RuntimeError(f"ZIP checksum failed: {bad}")
+                package.extractall(workspace)
         profile = workspace / "empty-user"
-        local = profile / "AppData" / "Local"
-        roaming = profile / "AppData" / "Roaming"
-        temp = local / "Temp"
-        temp.mkdir(parents=True)
-        roaming.mkdir(parents=True)
         env = dict(os.environ)
         for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
             env.pop(name, None)
-        system_root = Path(os.environ["SystemRoot"])
-        env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), APPDATA=str(roaming),
-                   TEMP=str(temp), TMP=str(temp), HF_HOME=str(profile / "huggingface"),
-                   FASTEMBED_CACHE_PATH=str(profile / "fastembed"), HF_HUB_OFFLINE="1",
-                   PLAYWRIGHT_BROWSERS_PATH=str(profile / "absent-browser-cache"),
-                   PATH=os.pathsep.join([str(system_root / "System32"), str(system_root)]))
+        if _is_linux():
+            config_dir = profile / ".config"
+            cache_dir = profile / ".cache"
+            data_dir = profile / ".local" / "share"
+            runtime_dir = profile / "runtime"
+            # Keep Chromium's SingletonSocket under Linux's 108-byte sun_path limit.
+            temp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="hdu-", dir="/tmp")))
+            for directory in (config_dir, cache_dir, data_dir, runtime_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            runtime_dir.chmod(0o700)
+            env.pop("WAYLAND_DISPLAY", None)
+            if env.get("DISPLAY"):
+                env.setdefault("QT_QPA_PLATFORM", "xcb")
+            else:
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env.update(HOME=str(profile), XDG_CONFIG_HOME=str(config_dir),
+                       XDG_CACHE_HOME=str(cache_dir), XDG_DATA_HOME=str(data_dir),
+                       XDG_RUNTIME_DIR=str(runtime_dir), TMPDIR=str(temp_dir),
+                       TEMP=str(temp_dir), TMP=str(temp_dir),
+                       HF_HOME=str(profile / "huggingface"),
+                       FASTEMBED_CACHE_PATH=str(profile / "fastembed"), HF_HUB_OFFLINE="1",
+                       PLAYWRIGHT_BROWSERS_PATH=str(profile / "absent-browser-cache"),
+                       PATH="/usr/bin:/bin")
+            executable = workspace / "HDUSign" / "HDUSign"
+        else:
+            local = profile / "AppData" / "Local"
+            roaming = profile / "AppData" / "Roaming"
+            temp = local / "Temp"
+            temp.mkdir(parents=True)
+            roaming.mkdir(parents=True)
+            system_root = Path(os.environ["SystemRoot"])
+            env.update(USERPROFILE=str(profile), LOCALAPPDATA=str(local), APPDATA=str(roaming),
+                       TEMP=str(temp), TMP=str(temp), HF_HOME=str(profile / "huggingface"),
+                       FASTEMBED_CACHE_PATH=str(profile / "fastembed"), HF_HUB_OFFLINE="1",
+                       PLAYWRIGHT_BROWSERS_PATH=str(profile / "absent-browser-cache"),
+                       PATH=os.pathsep.join([str(system_root / "System32"), str(system_root)]))
+            executable = workspace / "HDUSign" / "HDUSign.exe"
         report = workspace / "runtime.json"
-        result = subprocess.run([str(workspace / "HDUSign" / "HDUSign.exe"),
-                                 "--check-runtime", str(report)],
+        result = subprocess.run([str(executable), "--check-runtime", str(report)],
                                 cwd=workspace, env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=240, **hidden_subprocess_options())
         if not report.is_file():
-            raise RuntimeError(f"Runtime check exited with {result.returncode} without a report")
+            stderr_tail = (result.stderr or b"").decode("utf-8", errors="replace")[-1000:]
+            raise RuntimeError(
+                f"Runtime check exited with {result.returncode} without a report: {stderr_tail}"
+            )
         content = json.loads(report.read_text(encoding="utf-8"))
-        (BUILD / f"runtime-{VERSION}.json").write_text(
+        report_name = f"runtime-{VERSION}-linux-x64.json" if _is_linux() else f"runtime-{VERSION}.json"
+        (BUILD / report_name).write_text(
             json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
         if result.returncode or not content["ok"]:
             raise RuntimeError(content.get("error", "Runtime check failed"))
@@ -300,19 +386,45 @@ def write_version_resource() -> None:
     (BUILD / "windows-version.txt").write_text(str(resource), encoding="utf-8")
 
 
+def _write_linux_desktop_installer(app: Path) -> None:
+    script = app / "install-desktop.sh"
+    content = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "app_dir=$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" && pwd)\n"
+        "desktop_dir=\"${XDG_DATA_HOME:-$HOME/.local/share}/applications\"\n"
+        "mkdir -p \"$desktop_dir\"\n"
+        "cat > \"$desktop_dir/hdusign.desktop\" <<EOF\n"
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=HDUSign\n"
+        "Comment=HDU 课堂语音转写与签到辅助工具\n"
+        "Exec=$app_dir/HDUSign\n"
+        "Icon=$app_dir/_internal/assets/hdusign.png\n"
+        "Path=$app_dir\n"
+        "Terminal=false\n"
+        "Categories=Education;Utility;\n"
+        "EOF\n"
+        "echo \"Installed $desktop_dir/hdusign.desktop\"\n"
+    )
+    script.write_bytes(content.encode("utf-8"))
+    script.chmod(0o755)
+
+
 def build_release(ffmpeg_bundle: Path) -> None:
-    if sys.platform != "win32" or struct.calcsize("P") != 8:
-        raise SystemExit("Build with 64-bit Python on Windows.")
+    if (sys.platform != "win32" and not _is_linux()) or struct.calcsize("P") != 8:
+        raise SystemExit("Build with 64-bit Python on Windows or Linux.")
     BUILD.mkdir(exist_ok=True)
     require_files(ROOT / "models" / ASR_FOLDER, ASR_FILES)
     sources = source_hashes()
-    write_version_resource()
+    if sys.platform == "win32":
+        write_version_resource()
     ffmpeg = prepare_ffmpeg(ffmpeg_bundle)
     prepare_browsers()
     prepare_semantic_model()
     clear_generated(DIST)
-    log = BUILD / f"build-{VERSION}.log"
-    print(f"Building {VERSION}; PyInstaller output: {log}", flush=True)
+    log = BUILD / f"build-{VERSION}-{_platform_tag()}.log"
+    print(f"Building {VERSION} ({_platform_tag()}); PyInstaller output: {log}", flush=True)
     with log.open("w", encoding="utf-8") as stream:
         subprocess.run([sys.executable, "-X", "utf8", "-m", "PyInstaller", "--noconfirm", "--clean",
                         "--distpath", str(DIST), "--workpath", str(BUILD / "pyinstaller" / VERSION),
@@ -322,7 +434,10 @@ def build_release(ffmpeg_bundle: Path) -> None:
     app = DIST / "HDUSign"
     packaged_ffmpeg = app / "_internal" / "ffmpeg"
     require_files(packaged_ffmpeg, FFMPEG_FILES)
-    if sha256(packaged_ffmpeg / "ffmpeg.exe") != ffmpeg["binary_sha256"]:
+    packaged_ffmpeg_bin = packaged_ffmpeg / FFMPEG_BINARY
+    if _is_linux():
+        packaged_ffmpeg_bin.chmod(0o755)
+    if sha256(packaged_ffmpeg_bin) != ffmpeg["binary_sha256"]:
         raise RuntimeError("Packaging changed the FFmpeg executable; keep the original static binary.")
     copy_files(ROOT, app, ["README.md", "CHANGELOG.md", "LICENSE", "config.example.yaml"])
     shutil.copytree(ROOT / "docs", app / "docs")
@@ -331,36 +446,49 @@ def build_release(ffmpeg_bundle: Path) -> None:
     copy_dependency_licenses(app / "licenses")
     copy_files(ROOT / "models" / ASR_FOLDER, app / "models" / ASR_FOLDER, ASR_FILES)
     copy_files(RUNTIME / "models" / SEMANTIC_FOLDER, app / "models" / SEMANTIC_FOLDER, SEMANTIC_FILES)
+    if _is_linux():
+        _write_linux_desktop_installer(app)
     if source_hashes() != sources:
         raise RuntimeError("Source files changed during the build; rebuild before publishing")
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    archive = OUTPUT / f"HDUSign-{VERSION}-win64.zip"
+    archive = OUTPUT / _archive_name()
     print(f"Creating {archive.name}", flush=True)
     forbidden = {"config.yaml", "secrets_local.json", "session_local.json", "browser_profile",
                  "live_session.json", "live_profile", "accounts.json", "webhooks.json",
-                 "account_data", "notification_routes", "trajectory_library.json"}
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as package:
-        for path in sorted(app.rglob("*")):
-            relative = path.relative_to(DIST)
-            if any(part in forbidden for part in relative.parts) or path.suffix == ".jsonl":
-                raise RuntimeError(f"Private runtime data must not be packaged: {relative}")
-            if path.is_file():
-                package.write(path, relative.as_posix())
+                 "account_data", "notification_routes", "trajectory_library.json",
+                 "appearance.json"}
+    if _is_linux():
+        with tarfile.open(archive, "w:gz") as package:
+            for path in sorted(app.rglob("*")):
+                relative = path.relative_to(DIST)
+                if any(part in forbidden for part in relative.parts) or path.suffix == ".jsonl":
+                    raise RuntimeError(f"Private runtime data must not be packaged: {relative}")
+                if path.is_symlink() or path.is_file():
+                    package.add(path, arcname=relative.as_posix(), recursive=False)
+    else:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as package:
+            for path in sorted(app.rglob("*")):
+                relative = path.relative_to(DIST)
+                if any(part in forbidden for part in relative.parts) or path.suffix == ".jsonl":
+                    raise RuntimeError(f"Private runtime data must not be packaged: {relative}")
+                if path.is_file():
+                    package.write(path, relative.as_posix())
     print("Checking the extracted application with empty user caches", flush=True)
     runtime = verify_archive(archive)
     checksum = sha256(archive)
     source = ffmpeg["source_archive"]
-    (OUTPUT / "SHA256SUMS.txt").write_text(
+    (OUTPUT / _checksums_name()).write_text(
         f"{checksum}  {archive.name}\n{source['sha256']}  {source['name']}\n", encoding="ascii")
-    manifest = {"version": VERSION, "archive": str(archive.relative_to(ROOT)), "sha256": checksum,
+    manifest = {"version": VERSION, "platform": _platform_tag(),
+                "archive": str(archive.relative_to(ROOT)), "sha256": checksum,
                 "bytes": archive.stat().st_size, "source_hashes": sources, "runtime": runtime,
                 "ffmpeg": ffmpeg,
                 "dependencies": {name: importlib.metadata.version(name)
                                  for name in ("pyinstaller", "playwright", "fastembed", "sherpa-onnx")}}
-    (BUILD / f"release-{VERSION}-manifest.json").write_text(
+    _manifest_path().write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({key: manifest[key] for key in ("version", "archive", "bytes", "sha256")},
+    print(json.dumps({key: manifest[key] for key in ("version", "platform", "archive", "bytes", "sha256")},
                      ensure_ascii=False, indent=2), flush=True)
 
 
@@ -427,12 +555,14 @@ def find_release(client, api: str, tag: str):
 
 
 def upload_asset(client, api: str, release: dict, path: Path) -> dict:
+    content_type = ("application/zip" if path.suffix == ".zip" else
+                    "application/gzip" if path.name.endswith(".tar.gz") else
+                    "application/x-xz" if path.suffix == ".xz" else "text/plain")
     try:
         with ProgressFile(path) as stream:
             response = client.post(release["upload_url"].split("{", 1)[0],
                 params={"name": path.name}, data=stream, timeout=(30, 600),
-                headers={"Content-Type": "application/zip" if path.suffix == ".zip" else
-                         "application/x-xz" if path.suffix == ".xz" else "text/plain"})
+                headers={"Content-Type": content_type})
     except requests.RequestException as exc:
         # The server may have accepted every byte even if its response was lost.
         # Confirm the existing asset before doing any further write operation.
@@ -483,19 +613,27 @@ def publish_release(notes_path: Path) -> None:
         raise RuntimeError("The origin remote must be a GitHub repository")
     api = "https://api.github.com/repos/" + match[1]
 
-    manifest = json.loads((BUILD / f"release-{VERSION}-manifest.json").read_text(encoding="utf-8"))
-    archive = OUTPUT / f"HDUSign-{VERSION}-win64.zip"
+    manifest = json.loads(_manifest_path().read_text(encoding="utf-8"))
+    archive = OUTPUT / _archive_name()
     source = manifest["ffmpeg"]["source_archive"]
     source_archive = OUTPUT / source["name"]
     if not source_archive.is_file() or sha256(source_archive) != source["sha256"]:
         raise RuntimeError("The matching FFmpeg corresponding source must accompany the release")
-    assets = (archive, source_archive, OUTPUT / "SHA256SUMS.txt")
+    assets = (archive, source_archive, OUTPUT / _checksums_name())
     if (manifest["version"] != VERSION or manifest["source_hashes"] != source_hashes()
             or manifest["sha256"] != sha256(archive) or not manifest["runtime"]["ok"]):
         raise RuntimeError("Rebuild the release: source or archive differs from the verified build")
     if assets[2].read_text(encoding="ascii") != (
             f"{manifest['sha256']}  {archive.name}\n{source['sha256']}  {source['name']}\n"):
         raise RuntimeError("The checksum file does not match the archive")
+
+    known_other_assets = (
+        {f"HDUSign-{VERSION}-win64.zip", "ffmpeg-8.1.2-echosign-audio-source.tar.xz",
+         "ffmpeg-8.1.2-hdusign-audio-source.tar.xz", "SHA256SUMS.txt"}
+        if _is_linux()
+        else {f"HDUSign-{VERSION}-linux-x64.tar.gz", "ffmpeg-8.1.2-hdusign-audio-linux64-source.tar.xz",
+              "SHA256SUMS-linux-x64.txt"}
+    )
 
     with github_session() as client:
         branch = git("branch", "--show-current")
@@ -515,13 +653,13 @@ def publish_release(notes_path: Path) -> None:
                 "draft": True, "prerelease": False, "body": notes}))
         print(f"Release {release['id']}: {VERSION}, draft={release['draft']}", flush=True)
         existing = {asset["name"]: asset for asset in release["assets"]}
-        if set(existing) - {p.name for p in assets}:
+        if set(existing) - {p.name for p in assets} - known_other_assets:
             raise RuntimeError("The release has unexpected assets; inspect it before continuing")
         for path in assets:
             if path.name in existing:
                 verify_asset(existing[path.name], path)
                 continue
-            if not release["draft"]:
+            if not release["draft"] and not _is_linux():
                 raise RuntimeError("Refusing to modify assets in a published release")
             print(f"Uploading {path.name} ({path.stat().st_size / 1024 ** 2:.1f} MiB)", flush=True)
             upload_asset(client, api, release, path)

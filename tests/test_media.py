@@ -136,7 +136,7 @@ class MediaTests(unittest.TestCase):
 
     def test_bundle_is_preferred_and_frozen_never_uses_path(self):
         with tempfile.TemporaryDirectory() as folder:
-            executable = Path(folder) / "ffmpeg" / "ffmpeg.exe"
+            executable = Path(folder) / "ffmpeg" / media.FFMPEG_BINARY
             executable.parent.mkdir()
             executable.write_bytes(b"not executed")
             with patch.object(media, "resource_root", return_value=Path(folder)), \
@@ -310,6 +310,7 @@ class MediaTests(unittest.TestCase):
         errors = (b"SSL routines::certificate verify failed",
                   b"Peer certificate cannot be authenticated with given CA certificates",
                   b"The certificate is NOT trusted. The certificate issuer is unknown.",
+                  b"The certificate has been revoked.",
                   b"The name in the certificate does not match the expected.",
                   b"HTTP error 403 denied\ncertificate verification failed",
                   b"schannel: next InitializeSecurityContext failed: (0x80090325)",

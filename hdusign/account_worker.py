@@ -5,6 +5,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,21 +39,40 @@ def worker_main(argv):
 
     def watch():
         # A crashed parent must not leave monitors/live browsers running.
-        import ctypes
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
-        kernel.OpenProcess.restype = ctypes.c_void_p
-        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        handle = kernel.OpenProcess(0x100000, False, parent_pid)
-        try:
+        if sys.platform == "win32":
+            import ctypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel.OpenProcess.restype = ctypes.c_void_p
+            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel.OpenProcess(0x100000, False, parent_pid)
+            try:
+                while not stop.wait(.1):
+                    if ((directory / "stop").exists() or not handle
+                            or kernel.WaitForSingleObject(handle, 0) == 0):
+                        stop.set()
+            finally:
+                if handle:
+                    kernel.CloseHandle(handle)
+        else:
+            direct_child = (os.getppid() == parent_pid)
             while not stop.wait(.1):
-                if ((directory / "stop").exists() or not handle
-                        or kernel.WaitForSingleObject(handle, 0) == 0):
+                if (directory / "stop").exists():
                     stop.set()
-        finally:
-            if handle:
-                kernel.CloseHandle(handle)
+                    break
+                if direct_child:
+                    if os.getppid() != parent_pid:
+                        stop.set()
+                        break
+                elif parent_pid != os.getpid():
+                    try:
+                        os.kill(parent_pid, 0)
+                    except ProcessLookupError:
+                        stop.set()
+                        break
+                    except PermissionError:
+                        pass
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
@@ -231,10 +251,13 @@ class ProcessServices:
                 write_json(directory / "request.json", request)
                 output_file, reader_file = _open_log_pair(directory / "stdout.log")
             with output_file as output, reader_file as reader:
+                popen_kwargs = hidden_subprocess_options()
+                if sys.platform != "win32":
+                    popen_kwargs["start_new_session"] = True
                 with subprocess.Popen(self.command(directory), env=self.environment(credentials),
                                       cwd=self.root, stdin=subprocess.DEVNULL,
                                       stdout=output, stderr=subprocess.STDOUT,
-                                      **hidden_subprocess_options()) as process:
+                                      **popen_kwargs) as process:
                     self.process = process
                     stopping_at = None
                     pending = ""
@@ -255,9 +278,19 @@ class ProcessServices:
                                 (directory / "stop").touch()
                                 stopping_at = time.monotonic()
                             elif time.monotonic() - stopping_at > 10:
-                                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                                               capture_output=True, timeout=5,
-                                               **hidden_subprocess_options())
+                                if sys.platform == "win32":
+                                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                                   capture_output=True, timeout=5,
+                                                   **hidden_subprocess_options())
+                                else:
+                                    pid = getattr(process, "pid", None)
+                                    if isinstance(pid, int) and pid > 0:
+                                        try:
+                                            os.killpg(pid, signal.SIGKILL)
+                                        except (ProcessLookupError, OSError):
+                                            pass
+                                    if process.poll() is None:
+                                        process.kill()
                                 process.wait(timeout=5)
                         time.sleep(.04)
                     self.process = None

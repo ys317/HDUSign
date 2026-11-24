@@ -72,7 +72,6 @@ class ContinuousSigningTests(unittest.TestCase):
         alerter.notify.assert_not_called()
 
 
-@unittest.skipUnless(sys.platform == 'win32', 'DPAPI account environment')
 class SigningAccountTests(unittest.TestCase):
     def test_nested_source_child_loads_only_its_encrypted_account_credentials(self):
         source = Path(__file__).resolve().parents[1]

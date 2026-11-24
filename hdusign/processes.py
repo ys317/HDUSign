@@ -11,6 +11,6 @@ def hidden_subprocess_options() -> dict:
     Keep output redirection with the caller so captured logs, result files and
     explicitly supplied stdin continue to work in source and frozen builds.
     """
-    if sys.platform == "win32":
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
     return {}

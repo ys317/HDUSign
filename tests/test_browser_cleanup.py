@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -11,6 +12,7 @@ from unittest.mock import Mock, patch
 from hdusign import browser
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows browser command-line parsing")
 class CommandLineProfileTests(unittest.TestCase):
     def setUp(self):
         self.profile = Path(r"C:\EchoSign\browser_profile\accounts\abc")
@@ -66,6 +68,7 @@ class CleanupTests(unittest.TestCase):
             browser._cleanup_stale_profile(self.profile)
         return run, unlink
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows browser process cleanup")
     def test_no_matching_process_removes_only_stale_locks(self):
         run, unlink = self._cleanup([{
             "ProcessId": 22,
@@ -75,6 +78,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(unlink.call_count, 4)
         self.assertFalse(any(call.args[0] == "taskkill" for call in run.call_args_list))
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows browser process cleanup")
     def test_matching_process_is_left_running_and_locks_are_preserved(self):
         command_line = f'chrome.exe --user-data-dir="{self.profile}"'
         with patch.object(browser, "_commandline_uses_profile", return_value=True) as uses, \
@@ -90,6 +94,7 @@ class CleanupTests(unittest.TestCase):
         run.assert_called_once()
         unlink.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows browser process cleanup")
     def test_unreadable_process_inventory_fails_closed(self):
         with patch.object(browser.sys, "platform", "win32"), \
                 patch.object(subprocess, "run", return_value=Mock(

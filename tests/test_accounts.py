@@ -3,11 +3,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from hdusign.accounts import AccountStore, load_credentials, protect, session_credentials, SESSION_ENV
+from hdusign.accounts import (
+    AccountStore, SESSION_ENV, _protect_posix, load_credentials, protect, session_credentials,
+)
 from hdusign.desktop_controller import Controller
 from hdusign.demo import DemoServices
 import test_desktop_controller as fixtures
@@ -163,6 +166,50 @@ class AccountUsageTests(unittest.TestCase):
                     store.remember_use('saved', 200)
             self.assertEqual(store.last_used, {})
             self.assertEqual(store.path.read_bytes(), before)
+
+
+class PosixVaultTests(unittest.TestCase):
+    def test_posix_round_trip_uses_unique_nonces_and_hides_plaintext(self):
+        with tempfile.TemporaryDirectory() as folder:
+            key_path = Path(folder) / 'vault.key'
+            with patch.dict(os.environ, {'HDUSIGN_VAULT_KEY_PATH': str(key_path)}):
+                for secret in ('', 'abc123', ' 密码 with spaces 123 '):
+                    first = _protect_posix(secret)
+                    second = _protect_posix(secret)
+                    self.assertTrue(first.startswith('v1:'))
+                    self.assertNotEqual(first, second)
+                    if secret:
+                        self.assertNotIn(secret, first)
+                    self.assertEqual(_protect_posix(first, True), secret)
+                    self.assertEqual(_protect_posix(second, True), secret)
+            self.assertEqual(len(key_path.read_bytes()), 32)
+
+    def test_posix_rejects_tampered_payload_wrong_key_or_missing_key(self):
+        with tempfile.TemporaryDirectory() as folder:
+            key_path = Path(folder) / 'vault.key'
+            with patch.dict(os.environ, {'HDUSIGN_VAULT_KEY_PATH': str(key_path)}):
+                encrypted = _protect_posix('super-secret')
+                # Flip a character in the base64 payload.
+                tampered = encrypted[:-2] + ('A' if encrypted[-2] != 'A' else 'B') + encrypted[-1]
+                with self.assertRaises(OSError):
+                    _protect_posix(tampered, True)
+                with self.assertRaises(OSError):
+                    _protect_posix('invalid-prefix', True)
+                key_path.write_bytes(b'x' * 32)
+                with self.assertRaises(OSError):
+                    _protect_posix(encrypted, True)
+                key_path.unlink()
+                with self.assertRaises(OSError):
+                    _protect_posix(encrypted, True)
+
+    def test_protect_dispatches_to_posix_on_linux(self):
+        with tempfile.TemporaryDirectory() as folder:
+            key_path = Path(folder) / 'vault.key'
+            with patch.object(sys, 'platform', 'linux'), \
+                    patch.dict(os.environ, {'HDUSIGN_VAULT_KEY_PATH': str(key_path)}):
+                encrypted = protect('linux-secret')
+                self.assertTrue(encrypted.startswith('v1:'))
+                self.assertEqual(protect(encrypted, True), 'linux-secret')
 
 
 if __name__ == '__main__':

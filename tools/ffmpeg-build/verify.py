@@ -18,6 +18,7 @@ import re
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -29,6 +30,10 @@ SYSTEM_DLLS = {
     "advapi32.dll", "bcrypt.dll", "crypt32.dll", "kernel32.dll", "msvcrt.dll",
     "ncrypt.dll", "ole32.dll", "psapi.dll", "secur32.dll", "shell32.dll",
     "user32.dll", "ws2_32.dll", "ntdll.dll", "rpcrt4.dll",
+}
+LINUX_SYSTEM_LIBS = {
+    "libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2",
+    "librt.so.1", "libgnutls.so.30", "libgcc_s.so.1", "ld-linux-x86-64.so.2",
 }
 
 
@@ -78,13 +83,15 @@ def check_pcm(raw: bytes) -> dict:
 
 
 def audio_check(ffmpeg: Path, record: Path) -> tuple[dict, bytes]:
+    is_linux = sys.platform.startswith("linux")
+    tls_flag = "--enable-gnutls" if is_linux else "--enable-schannel"
     command = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin"]
     version = checked(command + ["-version"]).decode()
     configuration = checked(command + ["-buildconf"]).decode()
     license_text = checked(command + ["-L"]).decode()
     if not version.startswith("ffmpeg version 8.1.2-hdusign-audio "):
         raise AssertionError("Unexpected FFmpeg version")
-    for flag in ("--disable-gpl", "--disable-nonfree", "--disable-version3", "--disable-autodetect", "--enable-schannel"):
+    for flag in ("--disable-gpl", "--disable-nonfree", "--disable-version3", "--disable-autodetect", tls_flag):
         if flag not in configuration:
             raise AssertionError(f"Missing build setting: {flag}")
     normalized_license = " ".join(license_text.split())
@@ -99,9 +106,16 @@ def audio_check(ffmpeg: Path, record: Path) -> tuple[dict, bytes]:
     decoders = checked(command + ["-decoders"]).decode()
     if re.search(r"^\s*V[.A-Z]{5}\s+\w+", decoders, re.MULTILINE):
         raise AssertionError("A video decoder was enabled")
-    imports = re.findall(r"DLL Name:\s*(\S+)", (record / "pe-imports.txt").read_text())
-    if not imports or any(name.lower() not in SYSTEM_DLLS for name in imports):
-        raise AssertionError(f"Unexpected DLL dependency: {imports}")
+    if is_linux:
+        imports = re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]",
+                             (record / "elf-imports.txt").read_text())
+        if (not imports or "libgnutls.so.30" not in imports
+                or any(name not in LINUX_SYSTEM_LIBS for name in imports)):
+            raise AssertionError(f"Unexpected ELF shared library dependency: {imports}")
+    else:
+        imports = re.findall(r"DLL Name:\s*(\S+)", (record / "pe-imports.txt").read_text())
+        if not imports or any(name.lower() not in SYSTEM_DLLS for name in imports):
+            raise AssertionError(f"Unexpected DLL dependency: {imports}")
     common = command + ["-threads", "1", "-filter_threads", "1", "-protocol_whitelist", "pipe"]
     source = fixture()
     encoded = checked(common + ["-f", "wav", "-i", "pipe:0", "-map", "0:a:0", "-vn", "-sn", "-dn",
@@ -118,8 +132,9 @@ def audio_check(ffmpeg: Path, record: Path) -> tuple[dict, bytes]:
 
 
 def https_check(ffmpeg: Path, flv: bytes) -> list[dict]:
-    if not (os.name == "nt" and os.environ.get("GITHUB_ACTIONS") == "true"
-            and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"):
+    is_linux = sys.platform.startswith("linux")
+    if not is_linux and not (os.name == "nt" and os.environ.get("GITHUB_ACTIONS") == "true"
+                             and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"):
         raise RuntimeError("Certificate-store tests require a disposable GitHub-hosted Windows runner")
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -176,13 +191,19 @@ def https_check(ffmpeg: Path, flv: bytes) -> list[dict]:
     try:
         with tempfile.TemporaryDirectory(prefix="tls-ci-", dir=ROOT / "work") as directory:
             folder = Path(directory)
-            root_file = folder / "root.cer"
-            root_file.write_bytes(ca.public_bytes(serialization.Encoding.DER))
-            # CurrentUser root import can open a trust-confirmation dialog.
-            # This disposable hosted runner is elevated; use its machine store
-            # noninteractively, then remove only our unique generated test CA.
-            imported = True
-            checked(["certutil.exe", "-f", "-addstore", "Root", str(root_file)])
+            if is_linux:
+                root_file = folder / "root.pem"
+                root_file.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+                tls_args = ["-tls_verify", "1", "-ca_file", str(root_file)]
+            else:
+                root_file = folder / "root.cer"
+                root_file.write_bytes(ca.public_bytes(serialization.Encoding.DER))
+                # CurrentUser root import can open a trust-confirmation dialog.
+                # This disposable hosted runner is elevated; use its machine store
+                # noninteractively, then remove only our unique generated test CA.
+                imported = True
+                checked(["certutil.exe", "-f", "-addstore", "Root", str(root_file)])
+                tls_args = ["-tls_verify", "1"]
             for name, host, sans, trusted, should_pass in cases:
                 key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
                 subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test.invalid")])
@@ -213,7 +234,7 @@ def https_check(ffmpeg: Path, flv: bytes) -> list[dict]:
                     url = f"https://{host}:{server.server_port}/audio.flv"
                     result = run([str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin",
                                   "-rw_timeout", "5000000", "-protocol_whitelist", "https,tcp,tls,httpproxy",
-                                  "-tls_verify", "1", "-format_whitelist", "flv", "-i", url,
+                                  *tls_args, "-format_whitelist", "flv", "-i", url,
                                   "-map", "0:a:0", "-vn", "-sn", "-dn", "-threads", "1",
                                   "-filter_threads", "1", "-ac", "1", "-ar", "16000",
                                   "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"])
@@ -253,9 +274,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tls-ci", action="store_true")
     args = parser.parse_args()
+    is_linux = sys.platform.startswith("linux")
     build = build_path()
-    ffmpeg, record = build / "out/ffmpeg.exe", build / "record"
-    report = {"ok": False, "tls_backend": "schannel", "tls_ci": args.tls_ci,
+    ffmpeg = build / ("out/ffmpeg" if is_linux else "out/ffmpeg.exe")
+    record = build / "record"
+    report = {"ok": False, "tls_backend": "gnutls" if is_linux else "schannel",
+              "tls_ci": args.tls_ci,
               "binary_sha256": hashlib.sha256(ffmpeg.read_bytes()).hexdigest()}
     try:
         report["audio"], flv = audio_check(ffmpeg, record)

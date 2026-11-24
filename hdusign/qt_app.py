@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from PySide6.QtCore import QPointF, QRectF, QSize, QUrl, Qt, qInstallMessageHandler
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickImageProvider, QQuickWindow
 from PySide6.QtQuickControls2 import QQuickStyle
@@ -120,6 +120,25 @@ class Icons(QQuickImageProvider):
         return image
 
 
+def _desktop_fonts(app) -> tuple[str, str, str]:
+    if sys.platform == "win32":
+        # Use Windows' installed family and its matching regular/bold faces.
+        # Re-registering only msyh.ttc as an application font shadowed the system
+        # family and reproduced incorrect CJK glyphs in bold headings on Windows.
+        # Do not register or replace the user's system fonts here.
+        return "Microsoft YaHei UI", "Microsoft YaHei UI", "Cascadia Mono"
+    families = set(QFontDatabase.families())
+    body = next((name for name in (
+        "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
+        "Noto Sans SC", "Droid Sans Fallback", "DejaVu Sans",
+    ) if name in families), app.font().family() or "Sans Serif")
+    mono = next((name for name in (
+        "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono",
+        "Ubuntu Mono", "Monospace",
+    ) if name in families), "Monospace")
+    return body, body, mono
+
+
 def create_engine(controller, app=None):
     app = app or QGuiApplication.instance()
     QQuickWindow.setDefaultAlphaBuffer(True)
@@ -136,13 +155,7 @@ def create_engine(controller, app=None):
     qInstallMessageHandler(forward_message)
     if QQuickStyle.name() != "Basic":
         QQuickStyle.setStyle("Basic")
-    # Use Windows' installed family and its matching regular/bold faces.
-    # Re-registering only msyh.ttc as an application font shadowed the system
-    # family and reproduced incorrect CJK glyphs in bold headings on Windows.
-    # Do not register or replace the user's system fonts here.
-    body = "Microsoft YaHei UI"
-    heading = body
-    mono = "Cascadia Mono"
+    body, heading, mono = _desktop_fonts(app)
     app.setFont(QFont(body, 10))
     engine = QQmlApplicationEngine()
     from hdusign.appearance import Appearance
@@ -182,7 +195,11 @@ def main():
     app = QGuiApplication.instance() or QGuiApplication(sys.argv[:1])
     app.setApplicationName("HDUSign")
     app.setOrganizationName("HDUSign")
-    app.setWindowIcon(QIcon(str(resource_root() / "assets" / "hdusign.ico")))
+    assets_dir = resource_root() / "assets"
+    icon_path = assets_dir / "hdusign.ico"
+    if sys.platform != "win32" and (assets_dir / "hdusign.png").is_file():
+        icon_path = assets_dir / "hdusign.png"
+    app.setWindowIcon(QIcon(str(icon_path)))
     from hdusign.multi_account import AccountManager
     controller = AccountManager()
     engine, window = create_engine(controller, app)
@@ -247,6 +264,7 @@ def check_desktop_runtime():
             prompt = controller.robotPrompt
             if not prompt["visible"] or webhook_key(endpoint) in [choice["identity"] for choice in prompt["choices"]]:
                 raise RuntimeError("机器人冲突过滤自检失败")
+            appearance = engine.rootContext().contextProperty("appearance")
             for dark in (True, False):
                 controller.active._publish(dark=dark)
                 loop = QEventLoop()
@@ -254,7 +272,12 @@ def check_desktop_runtime():
                 loop.exec()
                 if window.grabWindow().isNull():
                     raise RuntimeError("Qt Quick 未生成有效画面")
-                if window.color().name() != ("#191919" if dark else "#ffffff"):
+                if bool(window.property("glassDark")) != dark:
+                    raise RuntimeError("Qt Quick 主题绑定失效")
+                if appearance and appearance.active:
+                    if window.color().alpha() != 0:
+                        raise RuntimeError("Qt Quick 透视外观未生效")
+                elif window.color().name() != ("#191919" if dark else "#ffffff"):
                     raise RuntimeError("Qt Quick 主题绑定失效")
             controller.confirmRobotChoice(prompt["ticket"], webhook_key(spare))
             assigned = current.cfg.get("reservation_webhooks", {}).get(live_course_url(overlap))

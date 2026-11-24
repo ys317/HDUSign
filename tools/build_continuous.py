@@ -6,8 +6,6 @@ matching official Python 3.13.7 runtime. Existing releases are never replaced.
 """
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
 import hashlib
 import json
 import marshal
@@ -64,6 +62,9 @@ def version_resource():
 
 
 def update_version(bootloader):
+    import ctypes
+    from ctypes import wintypes
+
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.BeginUpdateResourceW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL]
     kernel.BeginUpdateResourceW.restype = wintypes.HANDLE

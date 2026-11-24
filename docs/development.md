@@ -1,6 +1,6 @@
 # 开发指南
 
-Windows x64，Python 3.13。
+Windows x64 / Linux x64，Python 3.13。
 
 ## 本地运行
 
@@ -41,6 +41,28 @@ python -m hdusign code
 版本号统一维护在 `hdusign/__init__.py`，Windows 版本资源由构建工具自动生成。发布前先定稿代码、文档和图片，再构建；工具会校验源码摘要，避免上传与代码不一致的包。
 
 维护者提交代码并推送对应版本标签后，可运行 `python tools/release.py publish --notes <发布说明.md>`，将已构建的 ZIP 发布到 GitHub `origin` 仓库。
+
+### Linux x64 构建与 GitHub Actions
+
+Linux 便携版（`.tar.gz`）可通过本地 Linux 环境或 GitHub Actions（`.github/workflows/release-linux.yml`）构建：
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements.txt pyinstaller==6.22.2
+./.venv/bin/python -m playwright install chromium
+sudo ./.venv/bin/python -m playwright install-deps chromium
+./.venv/bin/python tools/fetch_asr_model.py
+```
+
+Linux 精简音频 FFmpeg 组件由 `.github/workflows/ffmpeg-audio-linux.yml` 使用 `tools/ffmpeg-build/build_linux.sh` 构建，输出 `ffmpeg-8.1.2-hdusign-audio-linux64.tar.gz` 与对应源码归档 `ffmpeg-8.1.2-hdusign-audio-linux64-source.tar.xz`。在带图形或虚拟显示（`xvfb-run`）的 Linux 环境执行：
+
+```bash
+QT_QUICK_BACKEND=software xvfb-run -a ./.venv/bin/python -m unittest discover -s tests -v
+QT_QUICK_BACKEND=software xvfb-run -a ./.venv/bin/python tools/release.py build \
+  --ffmpeg-bundle build/ffmpeg-audio-linux/ffmpeg-8.1.2-hdusign-audio-linux64.tar.gz
+```
+
+构建后生成 `dist/releases/<版本>/HDUSign-<版本>-linux-x64.tar.gz` 与 `SHA256SUMS-linux-x64.txt`。推送 `v*` 标签或在 GitHub Actions 手动触发 `release-linux.yml`（可勾选 `publish_release`）即可自动完成 Linux FFmpeg 编译、单元测试、打包验证与 Release 上传。
 
 ## 目录
 

@@ -821,7 +821,7 @@ def login_live(page_url: str, stop=None, *, switch_account: bool = False,
                             and current.port in (None, 443) and current.hostname in _SSO_HOSTS):
                         if not manual_login and not attempted and fill_attempts < 2:
                             try:
-                                page.wait_for_selector("input[type=password]", timeout=1000)
+                                page.wait_for_selector("input:visible", timeout=1000)
                                 secrets = credentials if credentials is not None else browser.load_secrets()
                                 ready = _url(page.url)
                                 if (ready is not None and ready.scheme == "https"

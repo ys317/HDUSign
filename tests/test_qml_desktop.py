@@ -114,7 +114,12 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertTrue(self.window.property('collapsed'))
         self.c.toggleTheme()
         QTest.qWait(30)
-        self.assertEqual(self.window.color().name(), '#ffffff')
+        appearance = self.engine.rootContext().contextProperty('appearance')
+        self.assertFalse(self.window.property('glassDark'))
+        if appearance and appearance.active:
+            self.assertEqual(self.window.color().alpha(), 0)
+        else:
+            self.assertEqual(self.window.color().name(), '#ffffff')
         self.assertFalse(self.window.grabWindow().isNull())
 
     def test_text_entry_survives_timer_and_transcript_updates(self):
@@ -222,10 +227,10 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertEqual(self.item('codeValue').property('text'), '等待识别')
         self.assertFalse(self.item('copyButton').isEnabled())
         self.c._publish(courseLoadState='error', courseError='课程暂时不可用')
-        QTest.qWait(30)
+        QTest.qWait(50)
         self.assertEqual(self.item('courseNoticeTitle').property('text'), '课程加载失败')
         self.click('retryCoursesButton')
-        for _ in range(50):
+        for _ in range(150):
             if not self.c._task:
                 break
             QTest.qWait(20)
@@ -238,7 +243,7 @@ class QmlDesktopTests(unittest.TestCase):
         self.click('navSettings')
         self.assertTrue(self.item('ongoingAction').isVisible())
         self.click('ongoingAction')
-        for _ in range(50):
+        for _ in range(150):
             if not self.c._task:
                 break
             QTest.qWait(20)
@@ -250,7 +255,7 @@ class QmlDesktopTests(unittest.TestCase):
         self.assertEqual(self.c._task, 'monitor')
         self.assertTrue(self.c._state['monitoring'])
         self.assertFalse(self.window.close())
-        for _ in range(50):
+        for _ in range(150):
             if not self.c._task:
                 break
             QTest.qWait(20)

@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -264,6 +265,13 @@ class AutoSigner:
                     **hidden_subprocess_options())
             except (OSError, subprocess.TimeoutExpired) as exc:
                 print(f"[warn] 浏览器子进程清理失败：{exc}")
+        else:
+            pid = getattr(proc, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
         if proc.poll() is None:
             proc.kill()
         proc.wait()
@@ -274,9 +282,12 @@ class AutoSigner:
         # Files avoid pipe-reader threads blocking shutdown if a browser inherits
         # a child's stdout/stderr. Result interpretation still uses result.json.
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            popen_kwargs = hidden_subprocess_options()
+            if sys.platform != "win32":
+                popen_kwargs["start_new_session"] = True
             with subprocess.Popen(
                     command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, cwd=str(ROOT),
-                    **hidden_subprocess_options()) as proc:
+                    **popen_kwargs) as proc:
                 deadline = time.monotonic() + self.timeout_s
                 try:
                     while proc.poll() is None:
@@ -421,9 +432,12 @@ class _BrowserSession:
         command = browser_command("--sign-worker", "--exchange-dir", str(self.directory))
         if not self.captcha_boost:
             command.append("--captcha-boost=off")
+        popen_kwargs = hidden_subprocess_options()
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
         self.proc = self.resources.enter_context(subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=str(ROOT),
-            **hidden_subprocess_options()))
+            **popen_kwargs))
         ready = self.directory / "ready.json"
         self._wait(ready)
         result = json.loads(ready.read_text(encoding="utf-8"))

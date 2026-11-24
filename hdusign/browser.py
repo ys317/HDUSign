@@ -26,6 +26,38 @@ from hdusign.runtime import data_root as application_root, configure_browser_run
 ROOT = application_root()
 PROFILE = ROOT / "browser_profile"
 START = "https://skl.hdu.edu.cn/index.html"
+_ATTENDANCE_HOST = "skl.hdu.edu.cn"
+_ATTENDANCE_SSO_HOSTS = frozenset(("sso.hdu.edu.cn", "cas.hdu.edu.cn"))
+_SSO_HOSTS = _ATTENDANCE_SSO_HOSTS | frozenset((
+    "https-sso-hdu-edu-cn-443.webvpn.hdu.edu.cn",
+    "https-cas-hdu-edu-cn-443.webvpn.hdu.edu.cn",
+))
+_EDITABLE_INPUT = ":visible:enabled:not([readonly])"
+_USERNAME_INPUT = (
+    "input:is([name=username], #username, [name=account], [autocomplete=username], "
+    "[placeholder*=账号], [placeholder*=学号], [placeholder*=用户名])" + _EDITABLE_INPUT
+)
+_USERNAME_FALLBACK = "input[type=text]:not([name*=ver])" + _EDITABLE_INPUT
+_PASSWORD_INPUT = "input:is([type=password], #password, [name=password], [autocomplete=current-password])"
+
+
+class SignPreparationError(RuntimeError):
+    """The login or sign-in page was unavailable before any code was entered."""
+
+
+def _https_host(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme == "https" and parsed.port in (None, 443):
+            return parsed.hostname
+    except ValueError:
+        pass
+    return None
+
+
+def _attendance_session_id(page) -> str:
+    return page.evaluate("""() => location.origin === 'https://skl.hdu.edu.cn'
+        ? localStorage.getItem('sessionId') || '' : ''""")
 
 
 def account_profile(secrets: dict) -> Path:
@@ -43,61 +75,54 @@ def load_secrets() -> dict:
 
 
 def try_sso_login(page, secrets: dict) -> bool:
-    """Fill the HDU SSO form. Returns True if a login submit was attempted.
-
-    The current 统一身份认证 page is an Angular form whose 登录 button stays
-    disabled until both fields register input, so fields are clicked before
-    filling and the button is awaited. Older CAS layouts fall back to heuristics.
-    """
-    user = secrets["skl_username"]
-    pwd = secrets["skl_password"]
-
-    user_selectors = ["input[name=username]", "#username", "input[name=account]",
-                      "input[type=text]:not([name*=ver])", "input[placeholder*=账号]",
-                      "input[placeholder*=学号]", "input[placeholder*=用户名]"]
-    filled_user = None
-    for sel in user_selectors:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            el.click()
-            el.fill(user)
-            filled_user = sel
-            break
-    pw_selectors = ["input[type=password]", "#password", "input[name=password]"]
-    filled_pw = None
-    for sel in pw_selectors:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            el.click()
-            el.fill(pwd)
-            filled_pw = sel
-            break
-    if not (filled_user and filled_pw):
-        print(f"[!] 没找齐输入框 (user={filled_user}, pwd={filled_pw}), 请手动在浏览器里完成登录")
+    """Fill the visible HDU SSO fields and attempt one submit."""
+    host = _https_host(page.url)
+    if host not in _SSO_HOSTS:
+        return False
+    user = secrets.get("skl_username")
+    password = secrets.get("skl_password")
+    if not user or not password:
+        print("[!] 缺少学号或密码，请在浏览器中完成登录，或在 EchoSign 中重新填写账号密码。", flush=True)
         return False
 
-    print(f"[i] 自动填充登录表单 ({filled_user} / {filled_pw})")
+    def fill(field, value):
+        # Pin the field to this document so an operation cannot follow a redirect.
+        element = field.element_handle(timeout=5000)
+        if _https_host(page.url) != host:
+            return False
+        element.click(timeout=2000)
+        element.fill(value, timeout=2000)
+        return True
+
     try:
-        page.wait_for_function(
-            "() => { const b = document.querySelector('button.login-button');"
-            " return !b || (!b.disabled && !b.classList.contains('disabled')); }", timeout=8000)
-    except PlaywrightTimeoutError:
-        print("[!] 登录按钮未启用，请在浏览器中手动完成登录")
+        available_user = page.locator(f"{_USERNAME_INPUT}, {_USERNAME_FALLBACK}").first
+        available_user.wait_for(state="visible", timeout=5000)
+        preferred_user = page.locator(_USERNAME_INPUT).first
+        if not fill(preferred_user if preferred_user.is_visible() else available_user, user):
+            return False
+        password_field = page.locator(_PASSWORD_INPUT + _EDITABLE_INPUT).first
+        if not fill(password_field, password):
+            return False
+    except PlaywrightError:
+        print("[!] 未能填齐学号和密码，请在浏览器中完成登录。", flush=True)
         return False
-    for sel in ["button.login-button", "button:has-text('登 录')", "button:has-text('登录')",
-                "#login_submit", "input[type=submit]", "button[type=submit]", ".login-btn", "#loginBtn"]:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            try:
-                el.click(timeout=5000)
-            except PlaywrightTimeoutError:
-                print(f"[!] 无法点击登录按钮 {sel}，请在浏览器中手动完成登录")
-                return False
-            print(f"[i] 点击登录: {sel}")
-            return True
-    print("[i] 未找到登录按钮, 尝试回车提交")
-    page.keyboard.press("Enter")
-    return True
+
+    print("[i] 已填写学号和密码，如需验证请在浏览器中完成。", flush=True)
+    if _https_host(page.url) != host:
+        return False
+    try:
+        for selector in ("button.login-button", "button:has-text('登 录')", "button:has-text('登录')",
+                         "#login_submit", "input[type=submit]", "button[type=submit]", ".login-btn", "#loginBtn"):
+            button = page.locator(selector).filter(visible=True).first
+            if button.is_visible():
+                button = page.locator(f"{selector}:not(.disabled)").filter(visible=True).first
+                button.click(timeout=8000)
+                return True
+        page.keyboard.press("Enter")
+        return True
+    except PlaywrightError:
+        print("[!] 未能提交登录表单，请在浏览器中完成登录。", flush=True)
+        return False
 
 
 CAMPUS_HOSTS = ("skl.hdu.edu.cn", "sso.hdu.edu.cn", "cas.hdu.edu.cn")
@@ -250,22 +275,23 @@ def login(stop=None) -> int:
             return 0
 
         deadline = time.time() + 180
-        login_attempted = False
+        attempted = set()
         while time.time() < deadline:
             if stop is not None and stop.is_set():
                 ctx.close()
                 return 0
             url = page.url
-            if "sso.hdu.edu.cn" in url or "cas.hdu.edu.cn" in url:
-                if not login_attempted:
+            host = _https_host(url)
+            if host in _ATTENDANCE_SSO_HOSTS:
+                if host not in attempted:
                     if not wait(1500):
                         ctx.close()
                         return 0
-                    login_attempted = True
+                    attempted.add(host)
                     try_sso_login(page, secrets)
-            elif "skl.hdu.edu.cn" in url:
-                token = page.evaluate("() => window.localStorage.getItem('sessionId') || ''")
-                if token:
+            elif host == _ATTENDANCE_HOST:
+                token = _attendance_session_id(page)
+                if token and _attendance_view_visible(page) and _https_host(page.url) == _ATTENDANCE_HOST:
                     print("[OK] 已确认登录态")
                     (ROOT / "session_local.json").write_text(
                         json.dumps({"x_auth_token": token, "captured_at": time.time()},
@@ -273,7 +299,7 @@ def login(stop=None) -> int:
                     print("[i] 已保存到 session_local.json")
                     ctx.close()
                     return 0
-                print(f"[i] 在 skl 页面但 localStorage 还没有 sessionId, url={url[:80]}")
+                print("[i] 正在等上课啦加载课堂签到入口")
             else:
                 print(f"[i] 当前页面: {url[:90]}")
             print("    (180秒内自动检测, 也可手动在浏览器里完成任何操作)")
@@ -298,32 +324,38 @@ def _location() -> tuple[float, float]:
 
 
 def ensure_logged_in(page, secrets: dict, timeout_s: int = 120) -> str:
-    page.goto(START, wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.goto(START, wait_until="domcontentloaded", timeout=60000)
+    except PlaywrightTimeoutError:
+        raise SignPreparationError("打开上课啦超时，请检查网络后重试；本次未提交。") from None
     deadline = time.monotonic() + timeout_s
-    attempted = False
+    attempted = set()
+    entry_deadline = None
     while time.monotonic() < deadline:
-        url = page.url
-        if "sso.hdu.edu.cn" in url or "cas.hdu.edu.cn" in url:
-            if not attempted:
-                try:
-                    page.locator("input[type=password]").first.wait_for(state="visible", timeout=5000)
-                    # A disabled submit / verification prompt needs the user;
-                    # repeatedly refilling it can interrupt that interaction.
-                    attempted = True
-                    try_sso_login(page, secrets)
-                except PlaywrightTimeoutError:
-                    pass
-        else:
+        host = _https_host(page.url)
+        if host in _ATTENDANCE_SSO_HOSTS:
+            entry_deadline = None
+            if host not in attempted:
+                # Leave rejected credentials or a verification prompt to the user.
+                attempted.add(host)
+                try_sso_login(page, secrets)
+        elif host == _ATTENDANCE_HOST:
             try:
-                token = page.evaluate("() => window.localStorage.getItem('sessionId') || ''")
+                token = _attendance_session_id(page)
+                if token and _attendance_view_visible(page) and _https_host(page.url) == _ATTENDANCE_HOST:
+                    return token
+                # A saved sessionId may precede an asynchronous SSO redirect.
+                if token and entry_deadline is None:
+                    entry_deadline = min(deadline, time.monotonic() + 15)
             except PlaywrightError as exc:
                 if "Execution context was destroyed" not in str(exc):
                     raise
-                token = ""
-            if token:
-                return token
+            if entry_deadline is not None and time.monotonic() >= entry_deadline:
+                break
         page.wait_for_timeout(100)
-    raise RuntimeError("登录态获取失败(超时)")
+    if entry_deadline is not None and _https_host(page.url) == _ATTENDANCE_HOST:
+        raise SignPreparationError("上课啦未加载「课堂签到」入口，请检查页面或重新登录签到；本次未提交。")
+    raise SignPreparationError("未确认上课啦登录成功，请核对学号和密码并完成网页验证；本次未提交。")
 
 
 def click_visible(page, selector: str, text: str | None = None, timeout_ms: int = 8000,
@@ -629,13 +661,41 @@ def _wait_for_sign_result(page, code, stage, check_cancelled, *, timeout_s=120) 
                 pass
 
 
+def _attendance_tab(page):
+    return page.get_by_text("课堂签到", exact=True).filter(visible=True).first
+
+
+def _on_sign_in_page(url: str) -> bool:
+    if _https_host(url) != _ATTENDANCE_HOST:
+        return False
+    parsed = urlparse(url)
+    return any(path.rstrip("/") == "/sign/in"
+               for path in (parsed.path, parsed.fragment.split("?", 1)[0]))
+
+
+def _attendance_view_visible(page) -> bool:
+    return _on_sign_in_page(page.url) or _attendance_tab(page).is_visible()
+
+
 def open_sign_in(page) -> None:
-    if not isinstance(page.url, str) or "/sign/in" not in page.url:
-        print("[i] 打开 课堂签到 ...")
-        click_visible(page, "span, button", "课堂签到", timeout_ms=15000)
-        page.wait_for_url("**/sign/in**", timeout=15000)
-    page.locator(KEYPAD).filter(has_text=re.compile(r"^\s*0\s*$")).filter(
-        visible=True).first.wait_for(state="visible", timeout=15000)
+    stage = "入口"
+    try:
+        if _https_host(page.url) != _ATTENDANCE_HOST:
+            raise SignPreparationError("上课啦登录已失效，请重新登录签到；本次未提交。")
+        if not _on_sign_in_page(page.url):
+            print("[i] 打开 课堂签到 ...")
+            with captcha_boost.automatic_input(page):
+                _attendance_tab(page).click(timeout=15000)
+            page.wait_for_url(_on_sign_in_page, timeout=15000)
+        stage = "键盘"
+        page.locator(KEYPAD).filter(has_text=re.compile(r"^\s*0\s*$")).filter(
+            visible=True).first.wait_for(state="visible", timeout=15000)
+        if not _on_sign_in_page(page.url):
+            raise SignPreparationError("签到页面已跳转，请重新登录签到；本次未提交。")
+    except PlaywrightTimeoutError:
+        if _https_host(page.url) in _ATTENDANCE_SSO_HOSTS:
+            raise SignPreparationError("上课啦页面跳回统一身份认证，请重新登录签到；本次未提交。") from None
+        raise SignPreparationError(f"上课啦未加载「课堂签到」{stage}，请检查页面；本次未提交。") from None
 
 
 def prepared_page_ready(page) -> bool:
@@ -645,9 +705,7 @@ def prepared_page_ready(page) -> bool:
     matched business response remains the authority for the sign-in result.
     """
     try:
-        url = urlparse(page.url)
-        if (url.scheme != "https" or url.netloc != "skl.hdu.edu.cn"
-                or "/sign/in" not in url.path + url.fragment):
+        if not _on_sign_in_page(page.url):
             return False
         return page.evaluate("""selector => {
             if (!localStorage.getItem('sessionId')) return false;
@@ -734,6 +792,8 @@ def sign(argv=None) -> int:
                 result = sign_with_code(ctx, page, code, on_stage=on_stage)
             finally:
                 ctx.close()
+    except SignPreparationError as exc:
+        result = SignResult("failure", code, str(exc))
     except Exception as exc:  # A browser error cannot establish a sign-in outcome.
         result = SignResult("unknown", code, f"浏览器操作异常：{exc}")
     print(f"[结果] {result.status}: {result.message}")
@@ -788,6 +848,9 @@ def serve_prepared(ctx, page, secrets: dict, directory: Path) -> None:
                 result = sign_with_code(ctx, page, code,
                                         on_stage=on_stage,
                                         cancelled=lambda: (directory / "stop.json").exists())
+        except SignPreparationError as exc:
+            session_invalid = True
+            result = SignResult("failure", code, str(exc))
         except Exception as exc:
             session_invalid = True
             result = SignResult("unknown", code, f"浏览器操作异常：{exc}")

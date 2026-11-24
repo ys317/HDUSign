@@ -2,11 +2,12 @@
 
 [![Release](https://img.shields.io/github/v/release/ys317/EchoSign)](https://github.com/ys317/EchoSign/releases/latest)
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078D4)
+![Linux](https://img.shields.io/badge/Linux-x64-FCC624)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-面向杭电(杭州电子科技大学)「上课啦」的 Windows 课堂辅助工具。将课堂声音实时转为文字，识别签到提示与四位口播签到码，并提供可选的企业微信通知和浏览器签到辅助。
+面向杭电(杭州电子科技大学)「上课啦」的 Windows / Linux 桌面课堂辅助工具。将课堂声音实时转为文字，识别签到提示与四位口播签到码，并提供可选的企业微信通知和浏览器签到辅助。
 
-[下载 Windows 版](https://github.com/ys317/EchoSign/releases/latest) · [快速开始](#快速开始) · [使用指南](docs/usage.md) · [问题反馈](https://github.com/ys317/EchoSign/issues)
+[下载发行版](https://github.com/ys317/EchoSign/releases/latest) · [快速开始](#快速开始) · [使用指南](docs/usage.md) · [问题反馈](https://github.com/ys317/EchoSign/issues)
 
 ## 功能特点
 
@@ -19,7 +20,7 @@
 - **可选通知与签到辅助**：支持按账号和课程绑定企业微信机器人，通知带姓名与课程名；保留自动签到、签到页预热和需要时的人工验证。
 - **启动诊断**：按账号保存运行日志，可记录最多三分钟启动音频，帮助排查收音和转写延迟。
 - **深浅主题**：实时转写与活动记录分区显示，主题切换后自动记住选择。
-- **解压即用**：Windows 发行包内置运行环境、浏览器、语音和语义模型。
+- **解压即用**：发行包内置运行环境、浏览器、语音和语义模型，支持 Windows x64 与 Linux x64。
 
 ## 界面截图
 
@@ -36,16 +37,18 @@
 
 ## 快速开始
 
-支持 **Windows 10 / 11 x64**，使用 CPU 即可运行。
+支持 **Windows 10 / 11 x64** 与 **Linux x64**（Ubuntu 22.04+ 等主流桌面发行版），使用 CPU 即可运行。
 
-**[下载 Windows 便携版](https://github.com/ys317/EchoSign/releases/latest)**。v2.4.0 增加连堂课、多账号和多门预约，保留自动签到与页面预热，详见[更新说明](docs/releases/v2.4.0.md)。
+**[下载便携版](https://github.com/ys317/EchoSign/releases/latest)**。v2.4.1 新增 Linux x64 便携版支持，延续连堂课、多账号、多门预约与自动签到功能，详见[更新说明](docs/releases/v2.4.1.md)。
 
-1. **解压并打开**：完整解压 Windows ZIP，双击其中的 `HDUSign.exe`。请保留同目录下的 `_internal/` 和 `models/`。
+1. **解压并打开**：
+   - **Windows**：完整解压 `HDUSign-*-win64.zip`，双击其中的 `HDUSign.exe`。请保留同目录下的 `_internal/` 和 `models/`。
+   - **Linux**：解压 `HDUSign-*-linux-x64.tar.gz` 后进入 `HDUSign/` 目录执行 `./HDUSign`；可选运行 `./install-desktop.sh` 注册桌面图标。请保留同目录下的 `_internal/` 和 `models/`。
 2. **输入账号密码**：进入设置，填写本人学号和密码，点击「登录并读取课程」。软件自动填写登录表单，若平台要求验证码，在浏览器中完成即可；登录后自动列出今明直播课；勾选记住后保存加密账号。
 3. **一键预约或监控**：选择课程，操作按钮会按开课时间显示「预约直播」或「开始监控」。可分别预约多门课程，也可切换账号继续操作。预约后保持软件运行，到点自动开始。无需复制网址、选择音频模式或另行保存。
 4. **结束或取消**：点击「停止监控」结束；预约等待期间点击「取消预约」。签到、通知和诊断等选项统一放在「设置」。
 
-无需安装 Python，也无需额外运行安装脚本。GitHub 自动提供的 `Source code` 压缩包用于源码开发，不包含可直接运行的 exe。
+无需安装 Python，也无需额外运行安装脚本。GitHub 自动提供的 `Source code` 压缩包用于源码开发，不包含可直接运行的可执行文件。
 
 ## 常用设置
 
@@ -75,7 +78,7 @@
 - `session_local.json`、`browser_profile/`：登录会话。
 - `live_session.json`、`live_profile/`：使用过后台音频时的直播登录会话。
 
-加密资料与当前 Windows 用户绑定，跨电脑或跨用户迁移可能需要重新登录并配置机器人。保留新版的 exe、`_internal/` 和 `models/`，打开后检查设置；直播登录过期时点击「登录并读取课程」，签到登录可在设置中刷新。v1.9 的签到会话按首页账号分别保存，首次使用可能需要重新验证。旧配置如仍使用 4 线程，可将 `asr.num_threads` 改为 `1` 并重启应用。
+加密资料与当前系统用户绑定（Windows 使用 DPAPI；Linux 密钥保存在 `~/.config/HDUSign/vault.key`），跨电脑或跨用户迁移可能需要重新登录并配置机器人。保留新版的主程序、`_internal/` 和 `models/`，打开后检查设置；直播登录过期时点击「登录并读取课程」，签到登录可在设置中刷新。v1.9 的签到会话按首页账号分别保存，首次使用可能需要重新验证。旧配置如仍使用 4 线程，可将 `asr.num_threads` 改为 `1` 并重启应用。
 
 ## 常见问题
 
@@ -107,7 +110,7 @@ docs/      使用指南、开发说明与第三方声明
 
 ## 隐私与免责声明
 
-语音转写和语义识别在本机完成；直播取声、登录、签到与企业微信通知需要联网。账号、配置和登录态保存在软件目录中。新版保存的密码和机器人链接由 Windows DPAPI 加密，当前 Windows 用户仍可解密；旧版遗留文件、登录会话、诊断音频和课堂日志仍需妥善保管。请勿公开分享使用过的软件目录；启用企业微信通知后，命中的文本与签到码会发送到你配置的机器人。
+语音转写和语义识别在本机完成；直播取声、登录、签到与企业微信通知需要联网。账号、配置和登录态保存在软件目录中。新版保存的密码和机器人链接在 Windows 上由 DPAPI 加密，在 Linux 上使用当前用户 `~/.config/HDUSign/vault.key` 保护，当前系统用户仍可解密；旧版遗留文件、登录会话、诊断音频和课堂日志仍需妥善保管。请勿公开分享使用过的软件目录；启用企业微信通知后，命中的文本与签到码会发送到你配置的机器人。
 
 HDUSign 是个人维护的非官方项目，与杭州电子科技大学及「上课啦」无隶属或合作关系。请仅用于本人有权访问的课程，并遵守学校、任课教师与平台规定。自动签到仅应在允许的范围内使用，不得用于代签、伪造位置或出勤、绕过身份验证。
 
