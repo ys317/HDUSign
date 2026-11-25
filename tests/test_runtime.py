@@ -119,5 +119,46 @@ class FFmpegRuntimeTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class ExternalSubprocessEnvTests(unittest.TestCase):
+    def test_frozen_linux_restores_original_ld_library_path(self):
+        base = {
+            "PATH": "/usr/bin",
+            "LD_LIBRARY_PATH": "/tmp/app/_internal:/usr/lib",
+            "LD_LIBRARY_PATH_ORIG": "/opt/hostedtoolcache/lib",
+        }
+        with patch.object(runtime.sys, "frozen", True, create=True), \
+                patch.object(runtime.sys, "platform", "linux"):
+            restored = runtime.external_subprocess_env(base)
+            self.assertEqual(restored["LD_LIBRARY_PATH"], "/opt/hostedtoolcache/lib")
+            self.assertNotIn("LD_LIBRARY_PATH_ORIG", restored)
+            self.assertIn("env", runtime.external_subprocess_kwargs())
+
+    def test_frozen_linux_drops_ld_library_path_when_orig_missing_or_empty(self):
+        for orig_value in (None, ""):
+            base = {"PATH": "/usr/bin", "LD_LIBRARY_PATH": "/tmp/app/_internal"}
+            if orig_value is not None:
+                base["LD_LIBRARY_PATH_ORIG"] = orig_value
+            with patch.object(runtime.sys, "frozen", True, create=True), \
+                    patch.object(runtime.sys, "platform", "linux"):
+                restored = runtime.external_subprocess_env(base)
+                self.assertNotIn("LD_LIBRARY_PATH", restored)
+                self.assertNotIn("LD_LIBRARY_PATH_ORIG", restored)
+
+    def test_unfrozen_or_windows_leaves_environment_untouched(self):
+        base = {
+            "PATH": "C:\\Windows\\System32",
+            "LD_LIBRARY_PATH": "/custom/lib",
+            "LD_LIBRARY_PATH_ORIG": "/orig/lib",
+        }
+        with patch.object(runtime.sys, "frozen", False, create=True), \
+                patch.object(runtime.sys, "platform", "linux"):
+            self.assertEqual(runtime.external_subprocess_kwargs(), {})
+            self.assertEqual(runtime.external_subprocess_env(base), base)
+        with patch.object(runtime.sys, "frozen", True, create=True), \
+                patch.object(runtime.sys, "platform", "win32"):
+            self.assertEqual(runtime.external_subprocess_kwargs(), {})
+            self.assertEqual(runtime.external_subprocess_env(base), base)
+
+
 if __name__ == "__main__":
     unittest.main()

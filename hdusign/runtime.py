@@ -67,6 +67,32 @@ def configure_browser_runtime() -> None:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
 
 
+def external_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Restore the host loader search path for external Linux binaries.
+
+    PyInstaller's Linux bootloader prepends ``_internal`` to ``LD_LIBRARY_PATH``
+    and stores the original value in ``LD_LIBRARY_PATH_ORIG``. External
+    binaries such as Playwright's Chromium and FFmpeg must inherit the host
+    loader path rather than loading bundled Python/Qt shared libraries (for
+    example a bundled ``libnss3.so`` without its sibling ``nss/libsoftokn3.so``).
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original:
+            env["LD_LIBRARY_PATH"] = original
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def external_subprocess_kwargs() -> dict[str, dict[str, str]]:
+    """Return ``{"env": ...}`` only when frozen on Linux so other environments stay untouched."""
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        return {"env": external_subprocess_env()}
+    return {}
+
+
 def semantic_model_options(model: str) -> dict:
     if model != SEMANTIC_MODEL:
         return {}
@@ -98,7 +124,7 @@ def check_ffmpeg_runtime(executable: str | Path | None = None) -> dict:
             result = subprocess.run(
                 [str(executable), "-hide_banner", "-loglevel", "error", "-nostdin", *arguments],
                 capture_output=True, check=True, timeout=20,
-                **options, **hidden_subprocess_options(),
+                **options, **hidden_subprocess_options(), **external_subprocess_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             detail = getattr(exc, "stderr", b"") or b""
@@ -183,7 +209,8 @@ def check_runtime(report_path: str) -> int:
                 if not executable.is_relative_to(resource_root() / "browsers"):
                     raise RuntimeError("浏览器未从发行包加载")
                 context = playwright.chromium.launch_persistent_context(
-                    str(Path(temporary) / "profile"), headless=True, channel="chromium")
+                    str(Path(temporary) / "profile"), headless=True, channel="chromium",
+                    **external_subprocess_kwargs())
                 try:
                     context.route("**/*", lambda route: route.abort())
                     page = context.pages[0] if context.pages else context.new_page()

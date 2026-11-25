@@ -21,7 +21,11 @@ from hdusign import captcha_boost
 from hdusign.attendance import SignResult, classify_response, diagnostic_sign_code, write_json
 from hdusign.location import DEFAULT_LAT, DEFAULT_LNG
 from hdusign.processes import hidden_subprocess_options
-from hdusign.runtime import data_root as application_root, configure_browser_runtime
+from hdusign.runtime import (
+    data_root as application_root,
+    configure_browser_runtime,
+    external_subprocess_kwargs,
+)
 
 ROOT = application_root()
 PROFILE = ROOT / "browser_profile"
@@ -254,7 +258,8 @@ def login(stop=None) -> int:
     profile = account_profile(secrets)
     _cleanup_stale_profile(profile)
     with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(str(profile), headless=False, args=_browser_args())
+        ctx = pw.chromium.launch_persistent_context(str(profile), headless=False, args=_browser_args(),
+                                                    **external_subprocess_kwargs())
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         def wait(milliseconds):
@@ -776,7 +781,8 @@ def sign(argv=None) -> int:
         secrets = load_secrets()
         with sync_playwright() as pw:
             ctx = pw.chromium.launch_persistent_context(str(account_profile(secrets)),
-                                                        headless=False, args=_browser_args())
+                                                        headless=False, args=_browser_args(),
+                                                        **external_subprocess_kwargs())
             try:
                 lat, lng = _location()
                 ctx.grant_permissions(["geolocation"], origin="https://skl.hdu.edu.cn")
@@ -876,7 +882,8 @@ def sign_worker(argv=None) -> int:
         configure_browser_runtime()
         secrets = load_secrets()
         with sync_playwright() as pw:
-            ctx = pw.chromium.launch_persistent_context(str(account_profile(secrets)), headless=False, args=_browser_args())
+            ctx = pw.chromium.launch_persistent_context(str(account_profile(secrets)), headless=False, args=_browser_args(),
+                                                        **external_subprocess_kwargs())
             try:
                 lat, lng = _location()
                 ctx.grant_permissions(["geolocation"], origin="https://skl.hdu.edu.cn")

@@ -36,8 +36,17 @@ for package in ('sherpa_onnx', 'soundcard', 'fastembed', 'onnxruntime',
 # These optional system libraries are pulled in by the build environment on
 # Windows but make QtCore prefer an incompatible ICU/OpenSSL pair.
 _qt_conflicting_dlls = {'icudt78.dll', 'icuuc.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll'}
+# NSS dynamically loads sibling modules (such as nss/libsoftokn3.so) relative to
+# libnss3.so. Keep NSS/NSPR resolved from the host OS on Linux so Chromium/TLS
+# never loads an incomplete bundled copy.
+_linux_system_libs = {
+    'libnss3.so', 'libnssutil3.so', 'libsmime3.so', 'libsoftokn3.so',
+    'libnspr4.so', 'libplc4.so', 'libplds4.so',
+}
 if IS_WIN:
     binaries = [entry for entry in binaries if Path(entry[0]).name.lower() not in _qt_conflicting_dlls]
+else:
+    binaries = [entry for entry in binaries if Path(entry[0]).name not in _linux_system_libs]
 
 
 a = Analysis(
@@ -62,6 +71,9 @@ a = Analysis(
 if IS_WIN:
     a.binaries = [entry for entry in a.binaries
                   if Path(entry[0]).name.lower() not in _qt_conflicting_dlls]
+else:
+    a.binaries = [entry for entry in a.binaries
+                  if Path(entry[0]).name not in _linux_system_libs]
 pyz = PYZ(a.pure)
 
 exe = EXE(

@@ -293,7 +293,8 @@ def verify_archive(archive: Path) -> dict:
                 package.extractall(workspace)
         profile = workspace / "empty-user"
         env = dict(os.environ)
-        for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
+        for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV",
+                     "LD_LIBRARY_PATH", "LD_LIBRARY_PATH_ORIG"):
             env.pop(name, None)
         if _is_linux():
             config_dir = profile / ".config"

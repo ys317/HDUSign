@@ -18,7 +18,7 @@ import numpy as np
 
 from hdusign.audio import SAMPLE_RATE
 from hdusign.processes import hidden_subprocess_options
-from hdusign.runtime import FFMPEG_BINARY, resource_root
+from hdusign.runtime import FFMPEG_BINARY, external_subprocess_kwargs, resource_root
 
 
 # Absorb a network catch-up burst or a slow recognizer without losing audio.
@@ -184,7 +184,8 @@ class FFmpegAudioSource:
         try:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       bufsize=0, **hidden_subprocess_options())
+                                       bufsize=0, **hidden_subprocess_options(),
+                                       **external_subprocess_kwargs())
         except (OSError, ValueError):
             # Do not retain CalledProcessError/TimeoutExpired or a chained
             # exception: those can contain the signed URL and Cookie arguments.

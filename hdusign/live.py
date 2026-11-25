@@ -15,7 +15,11 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
 import requests
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from hdusign.runtime import data_root as application_root, configure_browser_runtime
+from hdusign.runtime import (
+    data_root as application_root,
+    configure_browser_runtime,
+    external_subprocess_kwargs,
+)
 
 
 _SITE_HOSTS = frozenset(("course.hdu.edu.cn",
@@ -790,14 +794,16 @@ def login_live(page_url: str, stop=None, *, switch_account: bool = False,
             try:
                 if manual_login or credentials is not None:
                     live_browser = playwright.chromium.launch(
-                        headless=False, args=browser._browser_args(), timeout=30000)
+                        headless=False, args=browser._browser_args(), timeout=30000,
+                        **external_subprocess_kwargs())
                     context = live_browser.new_context()
                     print("请在新窗口手动登录要使用的直播账号。" if manual_login
                           else "正在使用填写的账号登录，需要验证码时请在窗口中完成。")
                 else:
                     context = playwright.chromium.launch_persistent_context(
                         str(application_root() / "live_profile"), headless=False,
-                        args=browser._browser_args(), timeout=30000)
+                        args=browser._browser_args(), timeout=30000,
+                        **external_subprocess_kwargs())
                 context.route("**/*", _block_viewing_writes)
                 page = context.pages[0] if context.pages else context.new_page()
                 try:
