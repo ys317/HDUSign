@@ -82,7 +82,7 @@ jobs:
       - name: Install Playwright Chromium and OS dependencies
         run: |
           python -m playwright install chromium
-          sudo python -m playwright install-deps chromium
+          sudo "$(command -v python)" -m playwright install-deps chromium
       - name: Run unit tests on Linux
         run: |
           PYTHONPATH="$PWD:$PWD/tests" QT_QUICK_BACKEND=software xvfb-run -a \
