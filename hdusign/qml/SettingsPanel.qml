@@ -103,6 +103,13 @@ Flickable {
             UiButton { objectName: "signinButton"; text: "重新登录签到"; outline: true; enabled: !appController.state.busy; onClicked: appController.runAction("signin") }
         }
 
+        Heading { text: "验证码自动通过" }
+        Toggle { objectName: "captchaSolverToggle"; caption: "大模型兜底识别"; description: "本地滑块/点选识别失败时，调用多模态大模型读图（最后手段，默认关闭）。"; fieldKey: "captchaSolver" }
+        Field { viewport: panel; caption: "接口地址"; fieldKey: "captchaBaseUrl" }
+        Field { viewport: panel; caption: "API Key"; fieldKey: "captchaApiKey"; secret: true }
+        Field { viewport: panel; caption: "模型名称"; fieldKey: "captchaModel" }
+        UiText { width: parent.width; text: "滑块与点选优先本地识别，不联网；仅本地失败且开启本项时才请求大模型。"; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap }
+
         Heading { text: "识别与通知" }
         Toggle { caption: "语义辅助识别"; description: "使用本地语义模型辅助判断签到提示。"; fieldKey: "semantic" }
         Column {

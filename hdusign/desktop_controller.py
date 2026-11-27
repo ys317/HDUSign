@@ -222,6 +222,10 @@ class Controller(QObject):
             autoSign=bool(self.cfg.get("auto_sign", {}).get("enabled", True)),
             semantic=bool(self.cfg.get("rules", {}).get("semantic", {}).get("enabled", False)),
             diagnostic=bool(self.cfg.get("diagnostics", {}).get("enabled", True)),
+            captchaSolver=bool((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("enabled", False)),
+            captchaBaseUrl=str((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("base_url", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
+            captchaApiKey=str((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("api_key", "")),
+            captchaModel=str((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("model", "qwen3.8-flash")),
             rules="\n".join(str(s) for s in self.cfg.get("rules", {}).get("strong", [])))
         self._login_snapshot = None
         self._saved_form = dict(self._form)
@@ -367,7 +371,7 @@ class Controller(QObject):
             return
         if self._task and key in ("username", "password", "remember"):
             return
-        value = bool(value) if key in ("live", "autoSign", "semantic", "remember", "diagnostic") else str(value)
+        value = bool(value) if key in ("live", "autoSign", "semantic", "remember", "diagnostic", "captchaSolver") else str(value)
         if self._form[key] == value:
             return
         if key in ("username", "password") and self._scheduled:
@@ -453,6 +457,11 @@ class Controller(QObject):
         cfg.setdefault("location", {}).update(coords)
         cfg.setdefault("rules", {}).setdefault("semantic", {})["enabled"] = self._form["semantic"]
         cfg.setdefault("diagnostics", {})["enabled"] = self._form["diagnostic"]
+        solver = cfg.setdefault("auto_sign", {}).setdefault("captcha_solver", {})
+        solver["enabled"] = bool(self._form["captchaSolver"])
+        solver["base_url"] = self._form["captchaBaseUrl"].strip()
+        solver["api_key"] = self._form["captchaApiKey"].strip()
+        solver["model"] = self._form["captchaModel"].strip()
         cfg["rules"]["strong"] = [s.strip() for s in self._form["rules"].splitlines() if s.strip()]
         self._schedule_config(cfg, self._schedules)
         secrets.update(skl_username=self._form["username"].strip(), skl_password=self._form["password"])

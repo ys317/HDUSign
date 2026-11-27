@@ -536,6 +536,11 @@ class AccountManager(QObject):
                     pass
         return None
 
+    @Property(int, notify=changed)
+    def maxMonitors(self):
+        """同时监听上限；0 表示不限制（供界面显示）。"""
+        return _max_monitors(getattr(self, "base_cfg", {}))
+
     @Property("QVariantMap", notify=robotPromptChanged)
     def robotPrompt(self):
         if not self._robot_requests or self.closing:
