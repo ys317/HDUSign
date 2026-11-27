@@ -18,6 +18,7 @@ import yaml
 from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from hdusign import captcha_boost
+from hdusign import captcha_local
 from hdusign.attendance import SignResult, classify_response, diagnostic_sign_code, write_json
 from hdusign.location import DEFAULT_LAT, DEFAULT_LNG
 from hdusign.processes import hidden_subprocess_options
@@ -614,6 +615,7 @@ def _wait_for_sign_result(page, code, stage, check_cancelled, *, timeout_s=120) 
         pending_result = None
         settle_at = started
         verification_clicked_at = None
+        local_attempted = False
         while time.monotonic() < deadline:
             check_cancelled()
             if verification_clicked_at is None and _click_verification(page, check_cancelled):
@@ -624,7 +626,20 @@ def _wait_for_sign_result(page, code, stage, check_cancelled, *, timeout_s=120) 
                             and time.monotonic() - verification_clicked_at < 3)
             visible = _captcha_visible(page)
             if visible and not click_pending:
-                require_verification()
+                # 原版点击未通过时：先尝试本地自动解题（滑块/点选/大模型兜底）
+                if not local_attempted:
+                    local_attempted = True
+                    try:
+                        solved = captcha_local.try_solve(page)
+                    except Exception:  # noqa: BLE001 - 解题异常一律回退人工
+                        solved = False
+                    if solved:
+                        stage("verification_solved", time.time())
+                        print("[i] 已自动尝试完成验证码，等待平台确认。", flush=True)
+                        page.wait_for_timeout(1200)
+                        continue
+                if _captcha_visible(page):
+                    require_verification()
             while responses:
                 response = responses.popleft()
                 try:

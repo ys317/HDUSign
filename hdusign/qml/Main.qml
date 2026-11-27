@@ -240,7 +240,7 @@ ApplicationWindow {
                 width: parent.width; spacing: 4
                 Row {
                     width: parent.width; spacing: 6
-                    UiText { text: "账号任务 · 上限 5 个"; color: Theme.subtle; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
+                    UiText { text: (accountManager && accountManager.maxMonitors > 0) ? ("账号任务 · 上限 " + accountManager.maxMonitors + " 个") : "账号任务"; color: Theme.subtle; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
                     UiButton { text: "+"; width: 28; height: 26; tooltip: "添加账号"; onClicked: { accountManager.activate(""); window.settingsVisible = true } }
                 }
                 ListView {

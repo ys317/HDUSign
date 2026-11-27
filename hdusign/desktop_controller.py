@@ -222,6 +222,10 @@ class Controller(QObject):
             autoSign=bool(self.cfg.get("auto_sign", {}).get("enabled", True)),
             semantic=bool(self.cfg.get("rules", {}).get("semantic", {}).get("enabled", False)),
             diagnostic=bool(self.cfg.get("diagnostics", {}).get("enabled", True)),
+            captchaSolver=bool((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("enabled", False)),
+            captchaBaseUrl=str((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("base_url", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")),
+            captchaApiKey=str((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("api_key", "")),
+            captchaModel=str((self.cfg.get("auto_sign", {}).get("captcha_solver") or {}).get("model", "qwen3.8-flash")),
             rules="\n".join(str(s) for s in self.cfg.get("rules", {}).get("strong", [])))
         self._login_snapshot = None
         self._saved_form = dict(self._form)
@@ -367,7 +371,7 @@ class Controller(QObject):
             return
         if self._task and key in ("username", "password", "remember"):
             return
-        value = bool(value) if key in ("live", "autoSign", "semantic", "remember", "diagnostic") else str(value)
+        value = bool(value) if key in ("live", "autoSign", "semantic", "remember", "diagnostic", "captchaSolver") else str(value)
         if self._form[key] == value:
             return
         if key in ("username", "password") and self._scheduled:
@@ -453,6 +457,11 @@ class Controller(QObject):
         cfg.setdefault("location", {}).update(coords)
         cfg.setdefault("rules", {}).setdefault("semantic", {})["enabled"] = self._form["semantic"]
         cfg.setdefault("diagnostics", {})["enabled"] = self._form["diagnostic"]
+        solver = cfg.setdefault("auto_sign", {}).setdefault("captcha_solver", {})
+        solver["enabled"] = bool(self._form["captchaSolver"])
+        solver["base_url"] = self._form["captchaBaseUrl"].strip()
+        solver["api_key"] = self._form["captchaApiKey"].strip()
+        solver["model"] = self._form["captchaModel"].strip()
         cfg["rules"]["strong"] = [s.strip() for s in self._form["rules"].splitlines() if s.strip()]
         self._schedule_config(cfg, self._schedules)
         secrets.update(skl_username=self._form["username"].strip(), skl_password=self._form["password"])
@@ -755,6 +764,15 @@ class Controller(QObject):
         if course:
             cfg.setdefault("live_audio", {})["enabled"] = True
         selected = course or self._selected()
+        # 自动预约：监听的是未来的课时，先自动预约，保证直播流可用
+        if (selected is not None and bool(self.cfg.get("auto_reserve", True))
+                and selected.start > time.time()
+                and not self._reserved(live_course_url(selected))):
+            try:
+                self._reserve_course(selected)
+                print(f"[i] 已自动预约课程：{selected.title}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - 预约失败不影响监听
+                print(f"[warn] 自动预约失败：{exc}", flush=True)
         cfg["notification_context"] = {"username": self._form["username"].strip(),
                                        "course_name": selected.title if selected else ""}
         cfg.pop("continuous_course", None)
