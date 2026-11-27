@@ -20,6 +20,16 @@ from hdusign.live import live_course_url
 from hdusign.reservation_webhooks import binding, binding_url, webhook_key, listening_window, windows_overlap
 
 
+def _max_monitors(cfg) -> int:
+    """同时监听的账号数上限；0（默认）表示不限制。"""
+    value = (cfg.get("accounts") or {}).get("max_monitors", 0)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)
+
+
 class WebhookStore:
     """Only a successful HTTP/business response can create a saved endpoint."""
     def __init__(self, root, legacy_url=""):
@@ -181,8 +191,9 @@ class ManagedController(Controller):
         if not self._form["live"] and course is None:
             self._feedback("多账号监听请使用后台直播音频。", True)
             return False
-        if self.manager.monitor_count() >= 5 and self._task != "monitor":
-            self._feedback("已同时运行 5 个账号，请先停止其中一个。", True)
+        limit = _max_monitors(self.cfg)
+        if limit and self.manager.monitor_count() >= limit and self._task != "monitor":
+            self._feedback(f"已同时运行 {limit} 个账号，请先停止其中一个（可在配置 accounts.max_monitors 调整，0=不限制）。", True)
             return False
         selected = course or self._selected()
         url = live_course_url(selected) if selected else self._form["url"].strip()

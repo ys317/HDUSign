@@ -90,3 +90,19 @@ alert:
   dedup_seconds: 90 # 相同文本在该时间内不重复告警
   webhook: # 企业微信群机器人: 群设置->群机器人->添加->复制 Webhook 地址
     url: "" # 可选；填写完整的企业微信机器人 Webhook 地址，留空则不推送
+
+# ====== 多账号 ======
+accounts:
+  max_monitors: 0   # 同时监听的账号数上限；0=不限制
+
+# ====== 自动预约 ======
+auto_reserve: true  # 监控未来的课时时自动预约直播，保证有流
+
+# ====== 验证码大模型兜底（最后手段，本地优先） ======
+auto_sign:
+  captcha_solver:
+    enabled: false
+    base_url: https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    api_key: ""
+    model: qwen3.8-flash
+    timeout_seconds: 20

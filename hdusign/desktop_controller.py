@@ -755,6 +755,15 @@ class Controller(QObject):
         if course:
             cfg.setdefault("live_audio", {})["enabled"] = True
         selected = course or self._selected()
+        # 自动预约：监听的是未来的课时，先自动预约，保证直播流可用
+        if (selected is not None and bool(self.cfg.get("auto_reserve", True))
+                and selected.start > time.time()
+                and not self._reserved(live_course_url(selected))):
+            try:
+                self._reserve_course(selected)
+                print(f"[i] 已自动预约课程：{selected.title}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - 预约失败不影响监听
+                print(f"[warn] 自动预约失败：{exc}", flush=True)
         cfg["notification_context"] = {"username": self._form["username"].strip(),
                                        "course_name": selected.title if selected else ""}
         cfg.pop("continuous_course", None)

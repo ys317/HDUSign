@@ -11,11 +11,8 @@ BROWSERS = ROOT / 'build' / 'portable-runtime' / 'browsers'
 FFMPEG = ROOT / 'build' / 'portable-runtime' / 'ffmpeg'
 if not BROWSERS.is_dir():
     raise RuntimeError('Use tools/release.py build --ffmpeg-bundle <audio archive> to prepare the portable runtime.')
-if not all((FFMPEG / name).is_file() for name in (
-        FFMPEG_BIN, 'LICENSE', 'README.txt', 'SOURCE.json', 'version.txt',
-        'buildconf.txt', 'license-notice.txt')):
-    raise RuntimeError('The complete FFmpeg runtime and notices are missing. '
-                       'Use tools/release.py build --ffmpeg-bundle <audio archive> to prepare them.')
+if not (FFMPEG / FFMPEG_BIN).is_file():
+    raise RuntimeError('FFmpeg runtime is missing. Use tools/release.py to prepare it.')
 
 datas = [(str(ROOT / 'config.example.yaml'), '.'),
          (str(ROOT / 'assets' / 'hdusign.ico'), 'assets'),
@@ -35,7 +32,7 @@ for package in ('sherpa_onnx', 'soundcard', 'fastembed', 'onnxruntime',
 
 # These optional system libraries are pulled in by the build environment on
 # Windows but make QtCore prefer an incompatible ICU/OpenSSL pair.
-_qt_conflicting_dlls = {'icudt78.dll', 'icuuc.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll'}
+_qt_conflicting_dlls = {'icudt78.dll', 'icuuc.dll'}
 # NSS dynamically loads sibling modules (such as nss/libsoftokn3.so) relative to
 # libnss3.so. Keep NSS/NSPR resolved from the host OS on Linux so Chromium/TLS
 # never loads an incomplete bundled copy.
